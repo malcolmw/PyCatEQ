@@ -7,7 +7,6 @@ import numpy as xp
 import obspy
 import pandas as pd
 import pathlib
-import pykonal
 import tqdm
 
 
@@ -50,12 +49,6 @@ def parse_argc():
         help="Output data directory."
     )
     parser.add_argument(
-        "traveltime_inventory",
-        nargs="?",
-        type=str,
-        help="Optional traveltime inventory."
-    )
-    parser.add_argument(
         "-f",
         "--format",
         type=str,
@@ -79,9 +72,6 @@ def parse_argc():
     argc.phases = argc.phases.split(",")
     for phase in argc.phases:
         assert phase in ("P", "S"), f"Invalid phase type: {phase}."
-
-    if argc.traveltime_inventory is not None:
-        argc.traveltime_inventory = pathlib.Path(argc.traveltime_inventory)
 
     return (argc)
 
@@ -177,14 +167,6 @@ def _read_catalog_hdf5(path):
     return (events, arrivals)
 
 
-def read_traveltime_field(path, network, station):
-    with pykonal.inventory.TraveltimeInventory(path, mode="r") as tt_inv:
-        tt_P_field = tt_inv.read(f"{network}/{station}/P")
-        tt_S_field = tt_inv.read(f"{network}/{station}/S")
-
-    return (tt_P_field, tt_S_field)
-
-
 def initialize_output(argc, nevents, tlead_P=TLEAD_P, tlag_P=TLAG_P, tlead_S=TLEAD_S, tlag_S=TLAG_S, sampling_rate=SAMPLING_RATE):
     path = argc.output_root.joinpath(".".join((argc.network, argc.station, "".join(argc.phases), "h5")))
     path.parent.mkdir(exist_ok=True, parents=True)
@@ -242,12 +224,8 @@ def initialize_output(argc, nevents, tlead_P=TLEAD_P, tlag_P=TLAG_P, tlead_S=TLE
 
 
 def populate_output(
-    argc, f5, phase, tlead, tlag, events, arrivals,
-    tt_field=None
+    argc, f5, phase, tlead, tlag, events, arrivals
 ):
-    """
-    If tt_field is provided, used the predicted arrival time to extract data.
-    """
     CHANNEL_MAP = {"Z": 0, "N": 1, "1": 1, "E": 2, "2": 2}
     network, station = argc.network, argc.station
     arrivals = arrivals.sort_values(["network", "station", "phase"])
@@ -261,17 +239,7 @@ def populate_output(
     for event_id, event in tqdm.tqdm(events.iterrows(), total=len(events)):
         event_idx = int(event["event_idx"])
         if event_id not in phase_arrivals.index:
-            if tt_field is None:
-                f5[f"mask_{phase}"][event_idx] = False
-                continue
-            else:
-                coords = event[["latitude", "longitude", "depth"]]
-                coords = pykonal.transformations.geo2sph(coords)
-                tt = tt_field.value(coords)
-                if xp.isnan(tt) or xp.isinf(tt):
-                    f5[f"mask_{phase}"][event_idx] = False
-                    continue
-                arrival_time = event["time"] + tt
+            f5[f"mask_{phase}"][event_idx] = False
         else:
             arrival_time = phase_arrivals.loc[event_id, "time"]
         arrival_time = obspy.UTCDateTime(arrival_time)
@@ -325,14 +293,6 @@ def main():
     events, arrivals = read_catalog(argc.catalog, argc)
     events = events.sort_values("event_id")
     events["event_idx"] = events.index
-    if argc.traveltime_inventory is not None:
-        tt_field_P, tt_field_S = read_traveltime_field(
-            argc.traveltime_inventory,
-            argc.network,
-            argc.station
-        )
-    else:
-        tt_field_P = tt_field_S = None
     try:
         f5 = initialize_output(argc, len(events))
         f5["event_id"][:] = events["event_id"].values
@@ -344,8 +304,7 @@ def main():
                 TLEAD_P if phase == "P" else TLEAD_S,
                 TLAG_P if phase == "P" else TLAG_S,
                 events,
-                arrivals,
-                tt_field=tt_field_P if phase == "P" else tt_field_S
+                arrivals
             )
     finally:
         f5.close()
