@@ -119,6 +119,7 @@ def subset_observations(dataf, events, ncc_min=NCC_MIN):
 
 def write_dtcc(dataf, path):
     path = pathlib.Path(path).joinpath("dt.cc")
+    path.parent.mkdir(parents=True, exist_ok=True)
     dataf["station"] = dataf["station"].map("{:>5s}".format)
     dataf["dtt"]     = dataf["dtt"].map("{:>6.3f}".format)
     dataf["ccmax"]   = dataf["ccmax"].abs().map("{:>5.3f}".format)
@@ -138,6 +139,7 @@ def write_dtcc(dataf, path):
 
 def write_events(events, path):
     path = pathlib.Path(path).joinpath("events.gc")
+    path.parent.mkdir(parents=True, exist_ok=True)
     desc = "Writing events.gc file"
     with open(path, mode="w") as outfile:
         for event_id, event in tqdm.tqdm(events.iterrows(), total=len(events), desc=desc):
