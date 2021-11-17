@@ -16,6 +16,7 @@ WFS_DTYPE       = xp.float32
 FILTER_BUFFER   = 5
 FILTER_ARGS     = ("bandpass",)
 FILTER_KWARGS   = dict(freqmin=1, freqmax=20)
+CHANNEL_PRIORITY = ("HH*", "BH*", "SH*", "EN*")
 
 def parse_argc():
     """
@@ -198,13 +199,13 @@ def initialize_output(argc, nevents, tlead_P=TLEAD_P, tlag_P=TLAG_P, tlead_S=TLE
     f5.require_dataset(
         "mask_P",
         shape=(nevents,),
-        dtype=xp.bool,
+        dtype=bool,
         exact=True
     )
     f5.require_dataset(
         "mask_S",
         shape=(nevents,),
-        dtype=xp.bool,
+        dtype=bool,
         exact=True
     )
     f5.require_dataset(
@@ -240,6 +241,7 @@ def populate_output(
         event_idx = int(event["event_idx"])
         if event_id not in phase_arrivals.index:
             f5[f"mask_{phase}"][event_idx] = False
+            continue
         else:
             arrival_time = phase_arrivals.loc[event_id, "time"]
         arrival_time = obspy.UTCDateTime(arrival_time)
@@ -252,19 +254,26 @@ def populate_output(
         #    station,
         #    "*"
         #)
-        data_path = argc.input_root.joinpath(
-            str(arrival_time.year),
-            network,
-            station,
-            f"{network}.{station}.*.*.{arrival_time.year:4d}.{arrival_time.julday:03d}",
-        )
-        try:
-            stream = obspy.read(
-                str(data_path),
-                starttime=starttime,
-                endtime=endtime
+        flag = False
+        for channel in CHANNEL_PRIORITY:
+            data_path = argc.input_root.joinpath(
+                str(arrival_time.year),
+                network,
+                station,
+                channel,
+                f"{network}.{station}.*.*.{arrival_time.year:4d}.{arrival_time.julday:03d}",
             )
-        except:
+            try:
+                stream = obspy.read(
+                    str(data_path),
+                    starttime=starttime,
+                    endtime=endtime
+                )
+            except:
+                continue
+            flag = True
+            break
+        if flag is False:
             f5[f"mask_{phase}"][event_idx] = False
             continue
         stream.sort()
