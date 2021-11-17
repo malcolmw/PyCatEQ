@@ -13,7 +13,7 @@ TEMPLATE_TLEAD_P = 0.25
 TEMPLATE_TLAG_P  = 0.75
 TEMPLATE_TLEAD_S = 0.25
 TEMPLATE_TLAG_S  = 1.25
-NPAIRS           = 200
+NPAIRS           = 1000
 CC_THRESHOLD     = 0.7
 CC_ABSOLUTE      = True
 
@@ -123,35 +123,6 @@ def correlate_event_pair(args):
     return(xp.array(idx_max), xp.array(cc_max))
 
 
-def __correlate_event_pair(args): # Revised from above to implement subsample precision
-    NSAMP_INTERP = 2
-
-    template_wfs, test_wfs = args
-    idx_max, cc_max = list(), list()
-
-    for i in range(3):
-        cc = cross_correlate(
-            template_wfs[:, i].copy(), # Copy is necessary to avoid using
-            test_wfs[:, i].copy()      # corrupt memory provided by
-        )                              # xp.lib.stride_tricks.as_strided.
-
-        if CC_ABSOLUTE is True:
-            idx = xp.argmax(xp.abs(cc))
-        else:
-            idx = xp.argmax(cc)
-        cc_max.append(cc[idx])
-
-        if idx > NSAMP_INTERP and idx < len(cc)-NSAMP_INTERP:
-            segment = xp.sign(cc[idx]) * cc[idx-NSAMP_INTERP: idx+NSAMP_INTERP+1]
-            x = xp.arange(idx-NSAMP_INTERP, idx+NSAMP_INTERP+1)
-            a, b, c = xp.polyfit(x, segment, 2)
-            idx = -b / (2 * a)
-
-        idx_max.append(idx)
-
-    return(xp.array(idx_max), xp.array(cc_max))
-
-
 def read_catalog(argc):
 
     if argc.format.upper() == "HDF5":
@@ -205,6 +176,7 @@ def _read_catalog_antelope(path):
         )
     )
 
+    events = events.sort_values("event_id")
     events = events.reset_index(drop=True)
 
     return (events)
@@ -317,11 +289,9 @@ def correlate_events(phase, events, npairs, f5in, nproc, maximum_distance):
 def main():
     argc = parse_argc()
     input_path = argc.input_root.joinpath(
-        ".".join((argc.network, argc.station, "h5"))
+        ".".join((argc.network, argc.station, "".join(argc.phases), "h5"))
     )
     EVENTS = read_catalog(argc)
-    print(EVENTS)
-    exit()
     argc.output_root.mkdir(exist_ok=True, parents=True)
 
     with h5py.File(str(input_path), mode="r") as f5in:
