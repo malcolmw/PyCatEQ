@@ -13,7 +13,7 @@ TEMPLATE_TLEAD_P = 0.25
 TEMPLATE_TLAG_P  = 0.75
 TEMPLATE_TLEAD_S = 0.25
 TEMPLATE_TLAG_S  = 1.25
-NPAIRS           = 1000
+NPAIRS           = 200
 CC_THRESHOLD     = 0.7
 CC_ABSOLUTE      = True
 
@@ -282,7 +282,11 @@ def correlate_events(phase, events, npairs, f5in, nproc, maximum_distance):
     pbar.update(1)
     pbar.close()
 
-    output = pd.concat((pd.DataFrame(o) for o in output), ignore_index=True)
+    try:
+        output = pd.concat((pd.DataFrame(o) for o in output), ignore_index=True)
+    except ValueError:
+
+        return (None)
 
     return (output)
 
@@ -314,13 +318,17 @@ def main():
                 maximum_distance=argc.maximum_distance
             )
 
+            if output is None:
+                print(f"No {phase}-wave differential travel times to save.")
+                continue
+
             path = argc.output_root.joinpath(
                 ".".join(( argc.network, argc.station, phase, "h5"))
             )
             output["network"] = argc.network
             output["station"] = argc.station
             output["phase"] = phase
-            print(f"Save {phase}-wave differential travel times to {path}.")
+            print(f"Saving {phase}-wave differential travel times to {path}.")
             try:
                 output.to_hdf(path, key="differentials", format="table")
             except:
