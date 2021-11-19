@@ -237,6 +237,8 @@ def populate_output(
     except KeyError:
         print(f"No {phase}-wave arrivals found for station {network}.{station}.")
 
+        return (True)
+
     phase_arrivals = phase_arrivals.sort_values("event_id")
     phase_arrivals = phase_arrivals.set_index("event_id")
     events = events.sort_values("event_id")
