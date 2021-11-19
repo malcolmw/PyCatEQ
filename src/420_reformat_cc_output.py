@@ -38,12 +38,12 @@ def parse_argc():
         default="HDF5",
         help="Input database format."
     )
-    
+
     return (parser.parse_args())
 
 
 def read_catalog(argc):
-    
+
     if argc.format.upper() == "HDF5":
 
         return (_read_catalog_hdf5(argc.catalog))
@@ -55,10 +55,10 @@ def read_catalog(argc):
     else:
 
         raise (NotImplementedError)
-        
-        
+
+
 def read_cc(argc, events):
-    
+
 
     dataf = pd.DataFrame()
 
@@ -67,7 +67,6 @@ def read_cc(argc, events):
         try:
             df = pd.read_hdf(path, key="differentials")
         except Exception as err:
-            print(err)
             continue
         df = df[
             (df["ccmax"].abs() > CC_THRESH)
@@ -86,7 +85,7 @@ def read_cc(argc, events):
             "the same database used to extract waveforms."
         )
         raise
-        
+
     dataf["dtt"] = dataf["dt"] - (dataf["origin_time_B"] - dataf["origin_time_A"])
     dataf = dataf[
         (dataf["ccmax"].abs() > CC_THRESH)
@@ -99,21 +98,21 @@ def read_cc(argc, events):
     dataf.reset_index(inplace=True)
     dataf.set_index(["event_id_A", "event_id_B"], inplace=True)
     dataf.sort_index(inplace=True)
-    
+
     return (dataf)
 
 
 def subset_observations(dataf, events, ncc_min=NCC_MIN):
-    
+
     group = dataf.groupby(["event_id_A", "event_id_B"])
     group = group.size()
     group = group[group >= ncc_min]
     dataf = dataf.loc[group.index]
-    
+
     event_ids = dataf.reset_index()[["event_id_A", "event_id_B"]].values.flatten()
     event_ids = np.sort(np.unique(event_ids))
     events = events.loc[event_ids]
-    
+
     return (dataf, events)
 
 
