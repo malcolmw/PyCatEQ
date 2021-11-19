@@ -231,8 +231,12 @@ def populate_output(
     network, station = argc.network, argc.station
     arrivals = arrivals.sort_values(["network", "station", "phase"])
     arrivals = arrivals.set_index(["network", "station", "phase"])
-    arrivals = arrivals.loc[(network, station)]
-    phase_arrivals = arrivals.loc[phase]
+    try:
+        arrivals = arrivals.loc[(network, station)]
+        phase_arrivals = arrivals.loc[phase]
+    except KeyError:
+        print(f"No {phase}-wave arrivals found for station {network}.{station}.")
+
     phase_arrivals = phase_arrivals.sort_values("event_id")
     phase_arrivals = phase_arrivals.set_index("event_id")
     events = events.sort_values("event_id")
@@ -247,21 +251,21 @@ def populate_output(
         arrival_time = obspy.UTCDateTime(arrival_time)
         starttime = arrival_time - tlead - FILTER_BUFFER
         endtime = arrival_time + tlag
-        #data_path = argc.input_root.joinpath(
-        #    str(arrival_time.year),
-        #    f"{arrival_time.julday:03d}",
-        #    network,
-        #    station,
-        #    "*"
-        #)
         flag = False
         for channel in CHANNEL_PRIORITY:
+            #data_path = argc.input_root.joinpath(
+            #    str(arrival_time.year),
+            #    network,
+            #    station,
+            #    channel,
+            #    f"{network}.{station}.*.*.{arrival_time.year:4d}.{arrival_time.julday:03d}",
+            #)
             data_path = argc.input_root.joinpath(
                 str(arrival_time.year),
+                f"{arrival_time.julday:03d}",
                 network,
                 station,
-                channel,
-                f"{network}.{station}.*.*.{arrival_time.year:4d}.{arrival_time.julday:03d}",
+                f"{network}.{station}.*.{channel}.*"
             )
             try:
                 stream = obspy.read(
