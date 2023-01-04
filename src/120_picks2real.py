@@ -1,0 +1,60 @@
+# USAGE: python 120_picks2real.py INPUT_FILE_0 [INPUT_FILE_1 [INPUT_FILE_2 [...]]] OUTPUT_DIR
+
+import argparse
+import pandas as pd
+import pathlib
+import sys
+import tqdm
+
+def parse_clargs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_files', type=str, nargs='+', help='Input files.')
+    parser.add_argument('output_dir', type=str, help='Output directory.')
+
+    return (parser.parse_args())
+
+def main():
+    clargs = parse_clargs()
+
+    picks = list()
+    for input_file in sorted(clargs.input_files):
+        picks.append(pd.read_hdf(input_file).reset_index())
+
+    picks = pd.concat(picks, ignore_index=True)
+    picks = picks.set_index(['network', 'station', 'phase'])
+    picks = picks.sort_index()
+    picks['amplitude'] = 0
+    for index in tqdm.tqdm(picks.index.unique()):
+        network, station, phase = index
+        _picks = picks.loc[index]
+        start_time = _picks['arrival_time'].min().floor('D')
+        end_time   = _picks['arrival_time'].max().ceil('D')
+        times = pd.date_range(start=start_time, end=end_time, freq='D')
+        for start_time, end_time in zip(times[:-1], times[1:]):
+            path = pathlib.Path(clargs.output_dir)
+            path = path.joinpath(
+                str(start_time.year),
+                f'{start_time.dayofyear:03d}',
+                f'{network}.{station}.{phase}.txt'
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _picks = picks.loc[index]
+            _picks = _picks[
+                 (_picks['arrival_time'] > start_time)
+                &(_picks['arrival_time'] < end_time)
+            ].copy()
+            _picks['arrival_time'] = _picks['arrival_time'] - start_time
+            _picks['arrival_time'] = _picks['arrival_time'].dt.total_seconds()
+            _picks.to_csv(
+                path,
+                columns=['arrival_time', 'probability', 'amplitude'],
+                index=False,
+                header=False,
+                float_format='%.3f',
+                sep=' ',
+            )
+
+
+
+if __name__ == '__main__':
+    main()

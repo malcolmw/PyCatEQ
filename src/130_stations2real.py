@@ -1,0 +1,31 @@
+import pandas as pd
+
+network = pd.read_hdf('/mnt/hdd/sjfz/network/geometry.hdf5', key='master')
+active = pd.read_hdf('/mnt/hdd/sjfz/network/geometry.hdf5', key='active_stations')
+active = active.set_index(['network', 'station'])
+network = network.groupby(['network', 'station', 'channel']).mean(numeric_only=True)
+network = network.sort_index()
+network = network.reset_index()
+network = network.set_index(['network', 'station'])
+network = network.loc[active.index]
+network = network.reset_index()
+network = network[network['channel'].str[2] == 'Z']
+network = network.drop_duplicates(subset=['network', 'station'])
+network['elevation'] -= network['depth']
+network['elevation'] *= 1e-3
+
+network.to_csv(
+    'stations.txt',
+    header=False,
+    index=False,
+    columns=[
+        'longitude',
+        'latitude',
+        'network',
+        'station',
+        'channel',
+        'elevation'
+    ],
+    float_format='%.6f',
+    sep=' '
+)

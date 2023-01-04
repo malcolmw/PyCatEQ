@@ -1,97 +1,240 @@
-# USAGE: python 100_pick.py INPUT_ROOT_DIR YEAR JDAY
+# USAGE: python 100_EQTransformer.py
 
 import argparse
 import configparser
 import json
+import my_logging
+import numpy as np
+import obspy
 import os
+import pandas as pd
 import pathlib
+import seisbench.models as sbm
 import tempfile
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-import EQTransformer.core.mseed_predictor
 
+logger = my_logging.get_logger(__name__)
 
 def parse_clargs():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_dir", type=str, help="Input data directory.")
-    parser.add_argument("output_dir", type=str, help="Output data directory.")
-    parser.add_argument("model", type=str, help="EQTransformer model weights.")
-    parser.add_argument("-c", "--config", type=str, help="Configuration file.")
-    parser.add_argument("-g", "--gpu", action="store_true", help="Run on GPU.")
+    parser.add_argument('start_date', type=str, help='Start date.')
+    parser.add_argument('end_date',   type=str, help='End date.')
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        default='100_EQTransformer.cfg',
+        type=str,
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        default='100_EQTransformer.log',
+        type=str,
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    parser.add_argument('-g', '--gpu', action='store_true', help='Run on GPU.')
 
-    return (parser.parse_args())
+    return parser.parse_args()
 
 
-def parse_config(clargs):
+def parse_config(config_file):
     parser = configparser.ConfigParser()
+    parser.read(config_file)
 
-    if clargs.config:
-        parser.read(clargs.config)
-
-    parser = parser["DEFAULT"]
-    config = dict(
-        detection_threshold=parser.getfloat("detection_threshold", fallback=0.3),
-        P_threshold=parser.getfloat("P_threshold", fallback=0.1),
-        S_threshold=parser.getfloat("S_threshold", fallback=0.1),
-        number_of_plots=parser.getint("number_of_plots", fallback=0),
-        plot_mode=parser.get("plot_mode", fallback="time"),
-        overlap=parser.getfloat("overlap", fallback=0.3),
-        batch_size=parser.getint("batch_size", fallback=500)
-
+    config = dict()
+    config['general'] = dict(
+        input_dir=pathlib.Path(parser.get(
+            'general',
+            'input_dir'
+        )),
+        output_dir=pathlib.Path(parser.get(
+            'general',
+            'output_dir'
+        ))
+    )
+    config['model'] = dict(
+        custom_model=parser.get(
+            'model',
+            'custom_model',
+            fallback=None
+        ),
+        detection_threshold=parser.getfloat(
+            'model',
+            'detection_threshold',
+            fallback=0.3
+        ),
+        P_threshold=parser.getfloat(
+            'model',
+            'P_threshold',
+            fallback=0.1
+        ),
+        S_threshold=parser.getfloat(
+            'model',
+            'S_threshold',
+            fallback=0.1
+        ),
+        overlap=parser.getint(
+            'model',
+            'overlap',
+            fallback=1800
+        ),
+        batch_size=parser.getint(
+            'model',
+            'batch_size',
+            fallback=1024
+        )
     )
 
-    return (config)
+    return config
 
 
 def main():
 
     clargs = parse_clargs()
-    config = parse_config(clargs)
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    logger.info('100_EQTransformer.py starting...')
+    for group in ('general', 'model'):
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+
+    model = load_model(config['model'])
 
     if clargs.gpu:
-        print("Running on GPU(s)")
+        logger.info('Running on GPU(s)')
+        model.cuda()
     else:
-        print("Running on CPU(s)")
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+        logger.info('Running on CPU(s)')
 
-    input_dir = pathlib.Path(clargs.input_dir)
-    output_dir = pathlib.Path(clargs.output_dir)
+    input_dir  = config['general']['input_dir']
 
-    for network_dir in sorted(input_dir.iterdir()):
-        stations = build_stations_dict(network_dir)
-        with tempfile.NamedTemporaryFile(mode="r+") as tmpfile:
-            json.dump(stations, tmpfile)
-            tmpfile.flush()
-            output_dir = output_dir.joinpath(
-                network_dir.name
-            )
-            EQTransformer.core.mseed_predictor(
-                input_model=clargs.model,
-                input_dir=str(network_dir),
-                output_dir=str(output_dir),
-                stations_json=tmpfile.name,
-                **config
-            )
-
-
-def build_stations_dict(network_dir):
-    print("Building station dict...")
-    stations = dict()
-    for station_dir in sorted(network_dir.iterdir()):
-        for dfile in sorted(station_dir.iterdir()):
-            network, station, _, channel = dfile.name.split("__")[0].split(".")
-            if station not in stations:
-                stations[station] = dict(
-                    network=network,
-                    channels=[channel],
-                    coords=[-1, -1, -1]
-                )
-            elif channel not in stations[station]["channels"]:
-                stations[station]["channels"].append(channel)
-
-    return (stations)
+    for date in pd.date_range(
+        start=clargs.start_date,
+        end=clargs.end_date,
+        freq='D'
+    ):
+        day_dir = input_dir.joinpath(
+            date.strftime('%Y'),
+            date.strftime('%j')
+        )
+        for net_dir in sorted(day_dir.iterdir()):
+            for sta_dir in sorted(net_dir.iterdir()):
+                logger.info(f'Processing {sta_dir}.')
+                try:
+                    process_station_dir(sta_dir, model, config)
+                except FileNotFoundError:
+                    logger.error(f'No data found for {sta_dir}.')
+                else:
+                    logger.info(f'Successfully processed {sta_dir}.')
 
 
-if __name__ == "__main__":
+def events_to_dataframe(events):
+    return pd.DataFrame(
+        [unpack_event(event) for event in events],
+        columns=[
+            'start_time',
+            'end_time',
+            'peack_value',
+            'network',
+            'station'
+        ]
+    )
+
+
+def load_model(config):
+    if config['custom_model'] is not None:
+        model = sbm.EQTransformer.load(config['custom_model'])
+        model.filter_args = ['bandpass']
+        model.filter_kwargs = dict(freqmin=1, freqmax=45, corners=2, zerophase=True)
+    else:
+        model = sbm.EQTransformer.from_pretrained('original')
+
+    return model
+
+
+def picks_to_dataframe(picks):
+    return pd.DataFrame(
+        [unpack_pick(pick) for pick in picks],
+        columns=[
+            'start_time',
+            'end_time',
+            'peak_time',
+            'peak_value',
+            'phase',
+            'network',
+            'station'
+        ]
+    )
+
+
+def process_station_dir(sta_dir, model, config):
+    try:
+        stream = obspy.read(sta_dir.joinpath('*'))
+    except:
+        raise FileNotFoundError
+    stream = resample_stream(stream)
+
+    picks, events = model.classify(stream, **config['model'])
+    if len(picks) == 0:
+        return
+    picks = picks_to_dataframe(picks)
+    events = events_to_dataframe(events)
+    start_time = picks['start_time'].min()
+    trace_id = '.'.join(picks.iloc[0][['network', 'station']])
+
+    output_dir = config['general']['output_dir']
+    pick_path = output_dir.joinpath(
+        start_time.strftime('%Y'),
+        start_time.strftime('%j'),
+        start_time.strftime(f'picks-%Y%j-{trace_id}.csv')
+    )
+    pick_path.parent.mkdir(exist_ok=True, parents=True)
+    picks.to_csv(pick_path, index=False)
+    event_path = output_dir.joinpath(
+        start_time.strftime('%Y'),
+        start_time.strftime('%j'),
+        start_time.strftime(f'events-%Y%j-{trace_id}.csv')
+    )
+    events.to_csv(event_path, index=False)
+
+
+def resample_stream(stream):
+    if not np.all([trace.stats.sampling_rate == 100 for trace in stream]):
+        stream = stream.resample(100)
+    return stream
+
+
+def unpack_event(event):
+    return (
+        event.start_time,
+        event.end_time,
+        event.peak_value,
+        *event.trace_id.split('.')[:2]
+    )
+
+def unpack_pick(pick):
+    return (
+        pick.start_time,
+        pick.end_time,
+        pick.peak_time,
+        pick.peak_value,
+        pick.phase,
+        *pick.trace_id.split('.')[:2]
+    )
+
+if __name__ == '__main__':
     main()
