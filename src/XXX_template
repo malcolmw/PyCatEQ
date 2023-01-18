@@ -1,0 +1,91 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan 11 13:14:45 2023
+
+@author: malcolmw
+"""
+import argparse
+import configparser
+import pathlib
+import sys
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    log_clargs(clargs)
+    log_config(config)
+    
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'network',
+        type=str,
+        help='Network code.'
+    )
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        type=str,
+        default=f'{sys.argv[0]}.cfg',
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    clargs = parser.parse_args()
+
+    return clargs
+
+
+def parse_config(config_file):
+    config = dict()
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config['general'] = dict()
+
+    return config
+
+def log_clargs(clargs):
+    logger.info('***Command-line arguments***')
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    
+    
+def log_config(config):
+    logger.info('***Configuration***')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+
+    
+if __name__ == '__main__':
+    main()

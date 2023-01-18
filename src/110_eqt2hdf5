@@ -1,4 +1,4 @@
-# USAGE: python 110_csv_to_hdf5.py INPUT_FILE_0 [INPUT_FILE_1 [INPUT_FILE_2 [...]]] OUTPUT_FILE
+#!/usr/bin/env python
 
 import argparse
 import pandas as pd
@@ -17,7 +17,7 @@ def main():
     clargs = parse_clargs()
     input_files = sum(
         [
-            sorted(pathlib.Path(input_dir).glob('**/*.csv'))
+            sorted(pathlib.Path(input_dir).glob('**/picks-*.csv'))
             for input_dir in clargs.input_dir
         ],
         []
@@ -33,9 +33,6 @@ def main():
         picks[time_field] = pd.to_datetime(picks[time_field])
 
 
-    picks['network'] = picks['trace_id'].str.split('.', expand=True)[0]
-    picks['station'] = picks['trace_id'].str.split('.', expand=True)[1]
-    picks = picks.drop(columns=['trace_id'])
     picks = picks.rename(columns=dict(
         start_time='event_start_time',
         end_time='event_end_time',
@@ -43,9 +40,8 @@ def main():
         peak_value='probability'
     ))
     picks = picks.sort_values(['network', 'station', 'event_start_time'])
-    picks = picks.set_index(['network', 'station'])
 
-    picks.to_hdf(clargs.output_file, key='picks')
+    picks.to_hdf(clargs.output_file, key='picks', format='table')
 
 if __name__ == '__main__':
     main()

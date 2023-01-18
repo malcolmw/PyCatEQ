@@ -1,0 +1,147 @@
+import argparse
+import pandas as pd
+import pathlib
+import tqdm
+
+def parse_clargs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_dir', type=str, help='Input directory.')
+    parser.add_argument('output_file',   type=str, help='Output file.')
+
+    return parser.parse_args()
+
+def main():
+    clargs = parse_clargs()
+    input_dir = pathlib.Path(clargs.input_dir)
+    output_file = pathlib.Path(clargs.output_file)
+    
+
+    next_event_id = 0
+    events, arrivals = list(), list()
+    for path in tqdm.tqdm(sorted(input_dir.glob('**/phase_sel.txt'))):
+        output = read_phase_sel(path)
+        if output is None:
+            continue
+        _events, _arrivals = output
+        _events['event_id'] = _events['serial_id'] + next_event_id - 1
+        _arrivals['event_id'] = _arrivals['serial_id'] + next_event_id - 1
+        next_event_id = _events['event_id'].max() + 1
+        events.append(_events)
+        arrivals.append(_arrivals)
+
+    if len(events) == 0:
+        return
+    
+    events = pd.concat(events, ignore_index=True)
+    arrivals = pd.concat(arrivals, ignore_index=True)
+    events = events[[
+        'event_id', 
+        'longitude',
+        'latitude',
+        'depth',
+        'time'
+    ]]
+    arrivals = arrivals[[
+        'network',
+        'station', 
+        'phase', 
+        'time',
+        'weight', 
+        'event_id'
+    ]]
+    events.to_hdf(output_file, key='events')
+    arrivals.to_hdf(output_file, key='arrivals')
+        
+
+def read_phase_sel(path):
+    with open(path, mode='r') as in_file:
+        lines = in_file.read().rstrip().split('\n')
+    n_lines = len(lines)
+    event_lines = list(filter(lambda i: len(lines[i]) == 113, range(n_lines)))
+    if len(event_lines) == 0:
+        return None
+    skip_lines = list(filter(lambda i: i not in event_lines, range(n_lines)))
+    events = pd.read_csv(
+        path,
+        skiprows=skip_lines,
+        delim_whitespace=True,
+        header=None,
+        names=[
+            'serial_id',
+            'year',
+            'month',
+            'day',
+            'time_of_day',
+            'seconds_of_day',
+            'residual',
+            'latitude',
+            'longitude',
+            'depth',
+            'magnitude',
+            'magnitude_var',
+            'n_p',
+            'n_s',
+            'n_ps',
+            'n_both',
+            'max_az_gap'
+        ]
+    )
+    events['time'] = pd.to_datetime(
+        events['year'].astype(str)
+        + events['month'].map(lambda month: f'-{month:02d}')
+        + events['day'].map(lambda day: f'-{day:02d}')
+        + events['time_of_day'].map(lambda time: f'T{time}Z')
+    )
+    
+    events = events.drop(columns=[
+        'year', 
+        'month', 
+        'day', 
+        'time_of_day', 
+        'seconds_of_day',
+        'magnitude',
+        'magnitude_var'
+    ])
+
+    events = events.set_index('serial_id')
+    phases = list()
+    for i_event in range(len(event_lines)):
+        if i_event < len(event_lines) - 1:
+            skip_lines = list(filter(
+                lambda i: not (event_lines[i_event] < i < event_lines[i_event+1]),
+                range(len(lines))
+            ))
+        else:
+            skip_lines = list(filter(
+                lambda i: not (event_lines[i_event] < i),
+                range(len(lines))
+            ))
+        _phases = pd.read_csv(
+            path,
+            skiprows=skip_lines,
+            delim_whitespace=True,
+            header=None,
+            names=[
+                'network',
+                'station',
+                'phase',
+                'second_of_day',
+                'travel_time',
+                'phase_amplitude',
+                'residual',
+                'weight',
+                'azimuth'
+            ]
+        )
+        _phases['serial_id'] = i_event+1
+        _phases['time'] = events.loc[i_event+1, 'time'] + pd.to_timedelta(
+            _phases['travel_time'], unit='S'
+        )
+        phases.append(_phases)
+    phases = pd.concat(phases, ignore_index=True)
+    events = events.reset_index()
+    
+    return events, phases
+
+if __name__ == "__main__":
+    main()

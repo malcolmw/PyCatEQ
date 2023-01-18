@@ -1,0 +1,391 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import argparse
+import configparser
+import h5py
+import numpy as np
+import obspy
+import pandas as pd
+import pathlib
+import sys
+import tqdm
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+WFS_DTYPE = np.float32
+TIME_DTYPE = np.float64
+
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'network',
+        type=str,
+        help='Network code.'
+    )
+    parser.add_argument(
+        'station',
+        type=str,
+        help='Station code.'
+    )
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        type=str,
+        default=f'{sys.argv[0]}.cfg',
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    argc = parser.parse_args()
+
+    return argc
+
+
+def parse_config(config_file):
+    config = dict()
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config['general'] = dict(
+        catalog=pathlib.Path(parser.get('general', 'catalog')).resolve(),
+        input_dir=pathlib.Path(parser.get('general', 'input_dir')).resolve(),
+        output_dir=pathlib.Path(parser.get('general', 'output_dir')).resolve(),
+        tlead_P=parser.getfloat('general', 'tlead_P', fallback=2.0),
+        tlag_P=parser.getfloat('general', 'tlag_P', fallback=2.0),
+        tlead_S=parser.getfloat('general', 'tlag_S', fallback=2.0),
+        tlag_S=parser.getfloat('general', 'tlag_S', fallback=2.0),
+        sampling_rate=parser.getint('general', 'sampling_rate', fallback=100),
+        channel_priority=eval(
+            parser.get(
+                'general',
+                'channel_priority',
+                fallback=('HH*', 'BH*', 'SH*', 'EN*')
+            )
+        )
+    )
+    config['filter'] = dict(
+        buffer=parser.getfloat('filter', 'buffer', fallback=5),
+        freq_min=parser.getfloat('filter', 'freq_min', fallback=1),
+        freq_max=parser.getfloat('filter', 'freq_max', fallback=20),
+        corners=parser.getint('filter', 'corners', fallback=2),
+        zero_phase=parser.getboolean('filter', 'zero_phase', fallback=True),
+    )
+    
+    return config
+
+
+def _deprecated_read_catalog(path, argc):
+
+    if argc.format.upper() == 'HDF5':
+
+        return (_read_catalog_hdf5(path))
+
+    elif argc.format.upper() == 'ANTELOPE':
+
+        return (_read_catalog_antelope(path, argc))
+
+    else:
+
+        raise (NotImplementedError)
+
+
+def _read_catalog_antelope(path, argc):
+
+    TABLES = dict(
+        arrival=[
+            'sta', 'time', 'arid', 'jdate', 'stassid', 'chanid', 'chan', 'iphase',
+            'stype', 'deltim', 'azimuth', 'delaz', 'slow', 'delslo', 'ema', 'rect',
+            'amp', 'per', 'logat', 'clip', 'fm', 'sur', 'qual', 'auth', 'commid',
+            'lddate'
+        ],
+        assoc=[
+            'arid', 'orid', 'sta', 'phase', 'belief', 'delta', 'seaz', 'esaz',
+            'timeres', 'timedef', 'azres', 'azdef', 'slores', 'slodef', 'emares',
+            'wgt', 'vmodel', 'commid', 'lddate'
+        ],
+        event=[
+            'evid', 'evname', 'prefor', 'auth', 'commid', 'lddate'
+        ],
+        origin=[
+            'lat', 'lon', 'depth', 'time', 'orid', 'evid', 'jdate', 'nass', 'ndef',
+            'ndp', 'grn', 'srn', 'etype', 'UNKNOWN', 'depdp', 'dtype', 'mb', 'mbid', 'ms',
+            'msid', 'ml', 'mlid', 'algorithm', 'auth', 'commid', 'lddate'
+        ]
+    )
+
+    db = dict()
+
+    for table in TABLES:
+        db[table] = pd.read_csv(
+            f'{path}.{table}',
+            header=None,
+            delim_whitespace=True,
+            names=TABLES[table]
+        )
+
+    events = db['event'].merge(
+        db['origin'][['lat', 'lon', 'depth', 'time', 'orid']],
+        left_on='prefor',
+        right_on='orid'
+    )
+
+    arrivals = db['arrival'][['sta', 'time', 'arid']].merge(
+        db['assoc'][['arid', 'orid', 'phase']],
+        on='arid'
+    ).merge(
+        events[['evid', 'orid']]
+    )
+
+    arrivals = arrivals.drop(columns=['arid', 'orid'])
+    arrivals = arrivals.rename(
+        columns=dict(
+            sta='station',
+            evid='event_id'
+        )
+    )
+    arrivals['network'] = argc.network
+
+    events = events[['lat', 'lon', 'depth', 'time', 'evid']]
+    events = events.rename(
+        columns=dict(
+            lat='latitude',
+            lon='longitude',
+            evid='event_id'
+        )
+    )
+
+    return (events, arrivals)
+
+
+def read_catalog(path):
+
+    events   = pd.read_hdf(path, key='/events')
+    arrivals = pd.read_hdf(path, key='/arrivals')
+    arrivals = arrivals.dropna(subset=[
+        'event_id', 
+        'network',
+        'station',
+        'phase',
+        'time'
+    ])
+
+    return events, arrivals
+
+
+def initialize_output(clargs, config, n_events):
+    path = config['general']['output_dir'].joinpath(
+        '.'.join((
+            clargs.network, 
+            clargs.station,
+            'hdf5'
+        ))
+    )
+    path.parent.mkdir(exist_ok=True, parents=True)
+    tlead_P = config['general']['tlead_P']
+    tlag_P  = config['general']['tlag_P']
+    tlead_S = config['general']['tlead_S']
+    tlag_S  = config['general']['tlag_S']
+    sampling_rate = config['general']['sampling_rate']
+
+    with h5py.File(path, mode='a') as out_file:
+        out_file.require_dataset(
+            'P',
+            shape=(n_events, int((tlead_P + tlag_P) * sampling_rate), 3),
+            dtype=WFS_DTYPE,
+            exact=True
+        )
+        out_file.require_dataset(
+            'S',
+            shape=(n_events, int((tlead_S + tlag_S) * sampling_rate), 3),
+            dtype=WFS_DTYPE,
+            exact=True
+        )
+        out_file.require_dataset(
+            'start_time_P',
+            shape=(n_events, 3),
+            dtype=TIME_DTYPE,
+            exact=True
+        )
+        out_file.require_dataset(
+            'start_time_S',
+            shape=(n_events, 3),
+            dtype=TIME_DTYPE,
+            exact=True
+        )
+        out_file.require_dataset(
+            'mask_P',
+            shape=(n_events,),
+            dtype=bool,
+            exact=True,
+            fillvalue=False
+        )
+        out_file.require_dataset(
+            'mask_S',
+            shape=(n_events,),
+            dtype=bool,
+            exact=True,
+            fillvalue=False
+        )
+        out_file.require_dataset(
+            'event_id',
+            shape=(n_events,),
+            dtype=np.int32,
+            exact=True
+        )
+        out_file['P'].attrs['n_samp_lead']    = int(tlead_P * sampling_rate)
+        out_file['P'].attrs['n_samp_lag']     = int(tlag_P * sampling_rate)
+        out_file['P'].attrs['sampling_rate'] = sampling_rate
+        out_file['S'].attrs['n_samp_lead']    = int(tlead_S * sampling_rate)
+        out_file['S'].attrs['n_samp_lag']     = int(tlag_S * sampling_rate)
+        out_file['S'].attrs['sampling_rate'] = sampling_rate
+
+    return path
+
+
+def populate_output(
+    clargs, config, out_file, phase, arrivals
+):
+    CHANNEL_MAP = {'Z': 0, 'N': 1, '1': 1, 'E': 2, '2': 2}
+    tlead = config['general'][f'tlead_{phase.upper()}']
+    tlag = config['general'][f'tlag_{phase.upper()}']
+    network, station = clargs.network, clargs.station
+    arrivals = arrivals.sort_values(['network', 'station', 'phase'])
+    arrivals = arrivals.set_index(['network', 'station', 'phase'])
+    try:
+        arrivals = arrivals.loc[(network, station, phase)]
+    except KeyError:
+        logger.info(
+            f'No {phase}-wave arrivals found for station {network}.{station}.'
+        )
+
+        return True
+
+    arrivals = arrivals.sort_values('event_id')
+    arrivals = arrivals.set_index('event_id')
+    sampling_rate = config['general']['sampling_rate']
+    event_ids = out_file['event_id'][:]
+
+    for event_id, arrival in tqdm.tqdm(
+            arrivals.iterrows(), 
+            total=len(arrivals)
+    ):
+        event_idx = np.argwhere(event_ids == event_id).flatten()
+
+        if len(event_idx) > 1:
+            logger.error(
+                f'Found duplicate event IDs {event_idx} in {out_file.name}.'
+            )
+            raise Exception()
+        elif len(event_idx) == 0:
+            logger.error(
+                f'Event ID {event_idx} appears to be missing from {out_file.name}.'
+            )
+            raise Exception()
+            
+        event_idx = event_idx[0]
+
+
+        arrival_time = obspy.UTCDateTime(arrival['time'])
+        start_time = arrival_time - tlead
+        end_time = arrival_time + tlag
+        flag = False
+        for channel in config['general']['channel_priority']:
+            data_path = config['general']['input_dir'].joinpath(
+                str(arrival_time.year),
+                f'{arrival_time.julday:03d}',
+                network,
+                station,
+                f'{network}.{station}.*.{channel}.*'
+            )
+            try:
+                stream = obspy.read(
+                    str(data_path),
+                    starttime=start_time-config['filter']['buffer'],
+                    endtime=end_time
+                )
+            except Exception as error:
+                logger.error(f'{error.args}')
+                continue
+            flag = True
+            break
+        if flag is False:
+            continue
+        
+        stream.sort()
+        try:
+            for trace in stream:
+                i = CHANNEL_MAP[trace.stats.channel[2]]
+                if trace.stats.sampling_rate != sampling_rate:
+                    trace.resample(sampling_rate)
+                trace.filter(
+                    'bandpass', 
+                    freqmin=config['filter']['freq_min'],
+                    freqmax=config['filter']['freq_max'],
+                    zerophase=config['filter']['zero_phase'],
+                    corners=config['filter']['corners']
+                )
+                trace.trim(starttime=start_time)
+                trace.normalize()
+                data = trace.data[:int((tlead + tlag) * sampling_rate)]
+                out_file[phase][event_idx, :len(data), i] = data
+                out_file[f'start_time_{phase}'][event_idx, i] = trace.stats.starttime.timestamp
+        except ValueError as error:
+            logger.error('Caught ValueError: {error.args}.')
+            continue
+        out_file[f'mask_{phase}'][event_idx] = True
+
+    return True
+
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+    events, arrivals = read_catalog(config['general']['catalog'])
+    event_ids = np.sort(np.unique(arrivals['event_id'].astype(int)))
+    
+    path = initialize_output(clargs, config, len(event_ids))
+    with h5py.File(path, mode='a') as out_file:
+        out_file['event_id'][:] = event_ids
+        for phase in ('P', 'S'):
+            populate_output(
+                clargs,
+                config,
+                out_file,
+                phase,
+                arrivals
+            )
+
+if __name__ == '__main__':
+    main()

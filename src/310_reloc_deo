@@ -1,0 +1,291 @@
+#!/usr/bin/env python
+
+import argparse
+import configparser
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+import pathlib
+import pykonal
+import sys
+import tqdm
+import warnings; warnings.filterwarnings('ignore')
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def parse_clargs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        default='310_reloc_deo.cfg',
+        type=str,
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        default='100_EQTransformer.log',
+        type=str,
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-n',
+        '--n_proc',
+        default=1,
+        type=int,
+        help='Number of processors.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+
+    return parser.parse_args()
+
+def parse_config(config_file):
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config = dict()
+    config['general'] = dict(
+        input_file=pathlib.Path(parser.get('general', 'input_file')).resolve(),
+        output_file=pathlib.Path(parser.get('general', 'output_file')).resolve(),
+        tt_inv_path=pathlib.Path(parser.get('general', 'tt_inv_path')).resolve()
+    )
+    config['range'] = dict(
+        d_lat=parser.getfloat('range', 'd_lat'),
+        d_lon=parser.getfloat('range', 'd_lon'),
+        d_depth=parser.getfloat('range', 'd_depth'),
+        d_time=parser.getfloat('range', 'd_time')
+    )
+    if parser.getboolean('reassociate', 'reassociate', fallback=False) is True:
+        config['reassociate'] = dict(
+            picks=pathlib.Path(parser.get('reassociate', 'picks')).resolve(),
+            P_threshold=parser.getfloat(
+                'reassociate', 
+                'P_threshold', 
+                fallback=0.5
+            ),
+            S_threshold=parser.getfloat(
+                'reassociate', 
+                'S_threshold', 
+                fallback=0.75
+            )
+        )
+    else:
+        config['reassociate'] = False
+
+    return config
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+    
+    events, arrivals, candidate_picks = load_events(config)
+
+    with mp.Pool(
+        clargs.n_proc,
+        initializer=init_pool,
+        initargs=(config, events, arrivals, candidate_picks)
+    ) as pool:
+        output = list(tqdm.tqdm(
+            pool.imap(target, events.index),
+            total=len(events)
+        ))
+
+    config['general']['output_file'].parent.mkdir(parents=True, exist_ok=True)
+    events = pd.concat([result[0] for result in output], ignore_index=True)
+    events['time'] = pd.to_datetime(events['time']*1e9, utc=True)
+    arrivals = pd.concat([result[1] for result in output], ignore_index=True)
+    arrivals['time'] = pd.to_datetime(arrivals['time']*1e9, utc=True)
+    events.to_hdf(config['general']['output_file'], key='/events')
+    arrivals.to_hdf(config['general']['output_file'], key='/arrivals')
+    
+    
+def get_arrival_dict(event_id, arrivals):
+    arrivals = arrivals.loc[event_id]
+    return dict(zip(arrivals.index, arrivals['time']))
+
+def load_events(config):
+    input_file = config['general']['input_file']
+    arrivals = pd.read_hdf(input_file, key='arrivals')
+    arrivals = arrivals.set_index(['event_id', 'network', 'station', 'phase'])
+    arrivals = arrivals.sort_index()
+    arrivals['time'] = arrivals['time'].map(lambda time: time.timestamp())
+    
+    events = pd.read_hdf(input_file, key='events')
+    events = events.set_index(['event_id'])
+    events = events.sort_index()
+    rtp = pykonal.transformations.geo2sph(
+        events[['latitude', 'longitude', 'depth']]
+    )
+    events['rho']   = rtp[:, 0]
+    events['theta'] = rtp[:, 1]
+    events['phi']   = rtp[:, 2]
+    events['time']  = events['time'].map(lambda time: time.timestamp())
+    
+    if config['reassociate'] is not False:
+        candidate_picks = pd.read_hdf(
+            config['reassociate']['picks'], 
+            key='/picks'
+        )
+        candidate_picks = candidate_picks.set_index(
+            ['network', 'station', 'phase']
+        )
+        candidate_picks = candidate_picks.sort_index()
+        candidate_picks['time'] = candidate_picks['arrival_time'].map(
+            lambda time: time.timestamp()
+        )
+    else:
+        candidate_picks = None
+
+    return events, arrivals, candidate_picks
+
+def relocate(event, arrivals):
+    global locator
+    global search_range
+
+    event_id = event.name
+    arrival_dict = get_arrival_dict(event_id, arrivals)
+    locator.clear_arrivals()
+    locator.add_arrivals(arrival_dict)
+    hypo = event[['rho', 'theta', 'phi', 'time']].values
+    hypo = locator.locate(hypo, search_range)
+    
+    return hypo
+    
+
+def target(event_id):
+    global config
+    global events
+    global arrivals
+    global locator
+    global candidate_picks
+    global phase_ids
+    global search_range
+
+    hypo = relocate(events.loc[event_id], arrivals)
+   
+    reloc = False
+    if config['reassociate'] is not False:
+        picks = reassociate(hypo)
+        if picks is None:
+            picks = arrivals.loc[event_id]
+            hypo = events.loc[
+                event_id,
+                ['latitude', 'longitude', 'depth', 'time']
+            ].values
+            hypo[:3] = pykonal.transformations.geo2sph(hypo[:3])
+        else:
+            reloc = True
+            picks['event_id'] = event_id
+            picks = picks.set_index([
+                'event_id',
+                'network',
+                'station',
+                'phase'
+            ])
+            event = pd.Series(
+                hypo, 
+                index=['rho', 'theta', 'phi', 'time'],
+                name=event_id
+            )
+            hypo = relocate(event, picks)
+    else:
+        picks = arrivals.loc[event_id]
+        
+    hypo[:3] = pykonal.transformations.sph2geo(hypo[:3])
+    event = pd.DataFrame([dict(
+        latitude=hypo[0],
+        longitude=hypo[1],
+        depth=hypo[2],
+        time=hypo[3],
+        event_id=event_id,
+        reloc=reloc
+    )])
+    picks = picks.reset_index()
+    return event, picks
+
+def reassociate(hypo):
+    global config
+    global events
+    global arrivals
+    global locator
+    global candidate_picks
+    global phase_ids
+    global search_range
+    
+    min_coords = (hypo-search_range)[:3]
+    max_coords = (hypo+search_range)[:3]
+    picks = list()
+    for phase_id in phase_ids:
+        network, station, phase = phase_id
+        _candidates = candidate_picks.loc[phase_id]
+        key = '/'.join(phase_id)
+        tt_field = locator.traveltime_inventory.read(
+            key,
+            min_coords=min_coords,
+            max_coords=max_coords
+        )
+        t0 = hypo[-1] + tt_field.resample(hypo[np.newaxis])[0]
+        dt = _candidates['time'] - t0
+        arg_min = np.argmin(np.abs(dt))
+        threshold = config['reassociate'][f'{phase}_threshold']
+        if np.abs(dt[arg_min]) < threshold:
+            picks.append(
+                _candidates.iloc[[arg_min]][['arrival_time', 'probability']]
+            )
+    if len(picks) == 0:
+        return None
+
+    picks = pd.concat(picks)
+    picks = picks.reset_index()
+    picks = picks.rename(columns=dict(arrival_time='time'))
+    picks['time'] = picks['time'].map(lambda time: time.timestamp())
+    
+    return picks
+
+
+def init_pool(_config, _events, _arrivals, _candidate_picks):
+    global config
+    global events
+    global arrivals
+    global locator
+    global candidate_picks
+    global phase_ids
+    global search_range
+    config = _config
+    events = _events
+    arrivals = _arrivals
+    candidate_picks = _candidate_picks
+    if candidate_picks is not None:
+        phase_ids = candidate_picks.index.unique()
+    locator = pykonal.locate.EQLocator(str(config['general']['tt_inv_path']))
+    search_range = np.array([
+        config['range']['d_depth'],
+        np.radians(config['range']['d_lon']),
+        np.radians(config['range']['d_lat']),
+        config['range']['d_time']
+    ])
+    
+
+if __name__ == "__main__":
+    main()

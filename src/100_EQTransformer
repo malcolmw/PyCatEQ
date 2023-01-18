@@ -1,16 +1,13 @@
-# USAGE: python 100_EQTransformer.py
+#!/usr/bin/env python
 
 import argparse
 import configparser
-import json
 import my_logging
 import numpy as np
 import obspy
-import os
 import pandas as pd
 import pathlib
 import seisbench.models as sbm
-import tempfile
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -94,6 +91,9 @@ def parse_config(config_file):
         )
     )
 
+    if config['model']['custom_model'].upper() in ('', 'NONE', 'FALSE'):
+        config['model']['custom_model'] = None
+
     return config
 
 
@@ -135,11 +135,15 @@ def main():
             for sta_dir in sorted(net_dir.iterdir()):
                 logger.info(f'Processing {sta_dir}.')
                 try:
-                    process_station_dir(sta_dir, model, config)
+                    output = process_station_dir(sta_dir, model, config)
                 except FileNotFoundError:
                     logger.error(f'No data found for {sta_dir}.')
+                except Exception as err:
+                    logger.error(f'Caught unexpected error: {type(err)}.')
+                    logger.error(f'{err}.')
                 else:
-                    logger.info(f'Successfully processed {sta_dir}.')
+                    n_p, n_s = output
+                    logger.info(f'Detected {n_p} P- and {n_s} S-waves.')
 
 
 def events_to_dataframe(events):
@@ -190,7 +194,7 @@ def process_station_dir(sta_dir, model, config):
 
     picks, events = model.classify(stream, **config['model'])
     if len(picks) == 0:
-        return
+        return 0, 0
     picks = picks_to_dataframe(picks)
     events = events_to_dataframe(events)
     start_time = picks['start_time'].min()
@@ -210,6 +214,11 @@ def process_station_dir(sta_dir, model, config):
         start_time.strftime(f'events-%Y%j-{trace_id}.csv')
     )
     events.to_csv(event_path, index=False)
+
+    n_p = len(picks[picks['phase'] == 'P'])
+    n_s = len(picks[picks['phase'] == 'S'])
+
+    return n_p, n_s
 
 
 def resample_stream(stream):

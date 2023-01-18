@@ -1,0 +1,493 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan 11 13:14:45 2023
+
+@author: malcolmw
+"""
+import argparse
+import configparser
+import h5py
+import numpy as np
+import pandas as pd
+import pathlib
+import pyproj
+import scipy as spx
+import scipy.ndimage
+import sys
+import tqdm
+
+try:
+    import cupy as cp
+    import cupyx.scipy as spx
+    import cupyx.scipy.ndimage
+    DEVICE_COUNT = cp.cuda.runtime.getDeviceCount()
+except ModuleNotFoundError:
+    DEVICE_COUNT = 0
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    log_clargs(clargs)
+    log_config(config)
+    
+    wf_file = config['general']['input_dir'].joinpath(
+        f'{clargs.network}.{clargs.station}.hdf5'
+    )
+    logger.info(wf_file)
+    out_file = initialize_output(config, clargs)
+    
+    with (
+            h5py.File(out_file, mode='a') as out_file, 
+            h5py.File(wf_file, mode='r') as wf_file
+    ):
+        for phase in ('P', 'S'):
+            logger.info(f'Cross-correlating {phase}-wave arrivals.')
+            # Load the event database
+            events = load_events(config)
+            # Discard events without waveforms
+            events = select_events_with_waveforms(events, wf_file, phase)
+            # Create a list of all correlated pairs of the form 
+            # (event_id_0, event_id_1), event_id_0 < event_id_1
+            correlated_pairs = list()
+            
+            for event_id, event in tqdm.tqdm(events.iterrows(), total=len(events)):
+                results = correlate_event(
+                    phase,
+                    event, 
+                    events, 
+                    config, 
+                    correlated_pairs,
+                    wf_file
+                )
+                #correlated_pairs = [
+                #    *correlated_pairs, 
+                #    *results['sorted_pair_ids']
+                #]
+                for attr in ('dt', 'cc_max', 'event_pair_ids'):
+                    n_obs = len(results[attr])
+                    handle = f'/{attr}/{phase}'
+                    datas = out_file[handle]
+                    size = len(datas)
+                    datas.resize(size+n_obs, axis=0)
+                    datas[size: ] = results[attr]
+                
+    
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'network',
+        type=str,
+        help='Network code.'
+    )
+    parser.add_argument(
+        'station',
+        type=str,
+        help='Station code.'
+    )
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        type=str,
+        default=f'{sys.argv[0]}.cfg',
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-d',
+        '--device_number',
+        type=int,
+        default=0,
+        help='CUDA device number to run on. This value is ignored unless the '
+        '-g option is specified.'
+    )
+    parser.add_argument(
+        '-g',
+        '--gpu',
+        action='store_true',
+        help='Run on GPU.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-n',
+        '--n_proc',
+        type=int,
+        default=1,
+        help='Number of parallel processes to run. This value is ignored if '
+        'the -d option is specified.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    clargs = parser.parse_args()
+
+    return clargs
+
+
+def parse_config(config_file):
+    config = dict()
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config['general'] = dict(
+        input_dir=pathlib.Path(parser.get('general', 'input_dir')).resolve(),
+        output_dir=pathlib.Path(parser.get('general', 'output_dir')).resolve(),
+        catalog=pathlib.Path(parser.get('general', 'catalog')).resolve(),
+        max_dist=parser.getfloat('general', 'max_dist', fallback=None),
+        n_pairs=parser.getint('general', 'n_pairs', fallback=100)
+    )
+    config['waveforms'] = dict(
+        template_tlead_P=parser.getfloat('waveforms', 'template_tlead_P'),
+        template_tlag_P=parser.getfloat('waveforms', 'template_tlag_P'),
+        template_tlead_S=parser.getfloat('waveforms', 'template_tlead_S'),
+        template_tlag_S=parser.getfloat('waveforms', 'template_tlag_S')
+    )
+    config['correlation'] = dict(
+        threshold=parser.getfloat('correlation', 'threshold'),
+        absolute=parser.getboolean('correlation', 'absolute')
+    )
+
+    return config
+
+def correlate_event(phase, event, events, config, correlated_pairs, wf_file):
+    n_pairs = config['general']['n_pairs']
+
+    # Sort events by distance from template event
+    sorted_events = dist_sort(
+        events, 
+        event, 
+        max_dist=config['general']['max_dist']
+    )
+    
+    selected_events, selected_pair_ids = select_events(
+        event,
+        sorted_events,
+        n_pairs,
+        correlated_pairs
+    )
+    selected_events = selected_events.sort_index()
+    
+    # Get the waveforms
+    X_template, X_test, template_start_time, test_start_times = get_waveforms(
+        wf_file,
+        phase,
+        event,
+        selected_events,
+        config
+    )
+    
+    # DO the correlation
+    # For now, just run on GPU.
+    xp = cp
+    X_template = xp.array(X_template)
+    X_test = xp.array(X_test)
+    test_start_times = xp.array(test_start_times)
+    template_start_time = xp.array(template_start_time)
+    xcorr = correlate_wfs(X_template, X_test)
+
+    if config['correlation']['absolute'] is True:
+        lag = xp.argmax(xp.abs(xcorr), axis=1)
+    else:
+        lag = xp.argmax(xcorr, axis=1)
+    i0 = np.repeat(np.arange(len(lag)), 3)
+    i1 = lag.flatten()
+    i2 = np.tile(np.arange(3), len(lag))
+    cc_max = xcorr[i0, i1, i2].reshape(-1, 3)
+
+    n_samp = X_template.shape[0]
+    lag -= n_samp//2 + n_samp%2
+
+    sampling_rate = wf_file[phase].attrs['sampling_rate']
+    #tlead = wf_file[phase].attrs['n_samp_lead'] / sampling_rate
+    #template_tlead = config['waveforms'][f'template_tlead_{phase}']
+    dt  = (test_start_times - template_start_time[xp.newaxis])
+    dt += lag / sampling_rate
+    #dt += (tlead - template_tlead) - lag / sampling_rate
+    dt  = xp.sum(dt * xp.abs(cc_max), axis=-1)
+    dt /= xp.sum(xp.abs(cc_max), axis=-1)
+    cc_max = xp.mean(cc_max, axis=-1)
+
+    event_pair_ids = form_pairs(
+        event.name, 
+        selected_events.index, 
+        sort=False
+    )
+    event_pair_ids = np.asarray(list(event_pair_ids))
+
+    # Discard measurements below threshold.
+    thresh = config['correlation']['threshold']
+    absolute = config['correlation']['absolute']
+    dt = dt.get()
+    cc_max = cc_max.get()
+    if absolute is True:
+        idxs = np.nonzero(np.abs(cc_max) >= thresh)
+    else:
+        idxs = np.nonzero(cc_max >= thresh)
+    dt = dt[idxs]
+    cc_max = cc_max[idxs]
+    event_pair_ids = event_pair_ids[idxs]
+
+    return dict(
+        dt=dt, 
+        cc_max=cc_max,
+        event_pair_ids=event_pair_ids,
+        sorted_pair_ids=selected_pair_ids
+    )
+
+
+def correlate_wfs(X_template, X_test):
+    xp = cp.get_array_module(X_template)
+
+    X_template = normalize(X_template, axis=0)
+    X_test = normalize(X_test, axis=1)
+    
+    n_samp = X_template.shape[0]
+
+    xcorr = xp.dstack([
+        spx.ndimage.correlate1d(
+            X_test[..., i_chan], 
+            X_template[..., i_chan],
+            mode='constant'
+        )
+        for i_chan in range(3)
+    ])
+    X_test = sliding_window(X_test, n_samp, axis=1)
+    norm = (
+        xp.sqrt(xp.sum(xp.square(X_template), axis=0))
+        * 
+        xp.sqrt(xp.sum(xp.square(X_test), axis=2))
+    )
+    
+    return xp.nan_to_num(xcorr / norm)
+
+    
+def normalize(X, axis=0):
+    xp = cp.get_array_module(X)
+    mu = xp.mean(X, axis=axis)
+    inds = [slice(None) for i in range(X.ndim)]
+    inds[axis] = xp.newaxis
+    inds = tuple(inds)
+    X = X - mu[inds]
+    sigma = xp.std(X, axis=axis)
+    X = X / sigma[inds]
+    X = xp.nan_to_num(X)
+    
+    return X
+
+    
+def select_events(event, sorted_events, n_pairs, correlated_pairs):
+    
+    # Form a list of event pair IDs for the sorted events.
+    pairs = form_pairs(event.name, sorted_events.index.values)
+
+    # Retain only the sorted events that have not already been 
+    # correlated against the template event.
+    selected_events = sorted_events[~pairs.isin(correlated_pairs).values]
+
+    # Retain only the n_pairs nearest neighbours.
+    selected_events = selected_events.iloc[:n_pairs]
+
+    # Remember the event pair IDs that were just correlated.
+    selected_pairs = form_pairs(event.name, selected_events.index.values)
+    
+    return selected_events, selected_pairs
+
+
+def sliding_window(X, window_length, axis=0):
+    xp = cp.get_array_module(X)
+    n_pad = window_length // 2
+    odd_bit = window_length % 2
+    pad = [(0, 0)] * X.ndim
+    pad[axis] = (n_pad+odd_bit, n_pad)
+    X = xp.pad(X, pad)
+    n_windows = X.shape[axis] - window_length
+    shape = (*X.shape[:axis], n_windows, window_length, *X.shape[axis+1:])
+    strides = (
+        *X.strides[:axis],
+         X.strides[axis],
+        *X.strides[axis:]
+    )
+    X_new = xp.lib.stride_tricks.as_strided(
+        X.copy(),
+        shape=shape,
+        strides=strides,
+    )
+
+    return X_new
+
+
+def dist_sort(events, event, max_dist=None):
+
+    events = events.drop(index=event.name)
+    
+    geod = pyproj.Geod(ellps='WGS84')
+    az, baz, dist = geod.inv(
+        np.repeat(event['longitude'], len(events)),
+        np.repeat(event['latitude'], len(events)),
+        events['longitude'],
+        events['latitude']
+    )
+    events['dist'] = np.sqrt(
+        np.square(dist * 1e-3)
+        +np.square(events['depth'] - event['depth'])
+    )
+
+    if max_dist is not None:
+        events = events[events['dist'] < max_dist]
+
+    events = events.sort_values('dist')
+    
+    return events
+
+
+def form_pairs(template_event_id, test_event_ids, sort=True):
+    # Form a list of event pair IDs for the sorted events.
+    pairs = np.stack([
+        np.repeat(template_event_id, len(test_event_ids)), 
+        test_event_ids
+    ])
+
+    if sort is True:
+        # Order event pair IDs
+        pairs = np.stack([
+            np.min(pairs, axis=0), 
+            np.max(pairs, axis=0)
+        ])
+
+    # Create a tuple of event pair IDs to access pd.Series.isin() method
+    pairs = pd.Series(tuple(zip(pairs[0], pairs[1])), dtype=object)
+
+    return pairs
+
+
+def select_events_with_waveforms(events, wf_file, phase):
+    event_ids = wf_file['event_id'][:]
+    event_idx_lookup = pd.Series(
+        range(len(event_ids)),
+        index=event_ids
+    )
+    mask = wf_file[f'mask_{phase}'][:]
+    event_ids = event_ids[mask]
+    # Just events with waveforms
+    events = events.loc[event_ids]
+    # Assign lookup index.
+    events['event_index'] = event_idx_lookup[event_ids]
+    
+    return events
+
+
+def get_waveforms(wf_file, phase, template_event, test_events, config):
+    n_samp_lead = wf_file[phase].attrs['n_samp_lead']
+    n_samp_lag = wf_file[phase].attrs['n_samp_lag']
+    sampling_rate = wf_file[phase].attrs['sampling_rate']
+    
+    template_tlead = config['waveforms'][f'template_tlead_{phase}']
+    template_tlag  = config['waveforms'][f'template_tlag_{phase}']
+    template_tlead = config['waveforms'][f'template_tlead_{phase}']
+    template_n_samp_lead = int(sampling_rate*template_tlead)
+    template_n_samp_lag = int(sampling_rate*template_tlag)
+    
+    i_samp_start = n_samp_lead - template_n_samp_lead
+    i_samp_end   = n_samp_lead + template_n_samp_lag
+    if i_samp_start < 0 or i_samp_end > n_samp_lead+n_samp_lag:
+        logger.warning('Event waveforms are too short for request template length')
+        i_samp_start = max(0, i_samp_start)
+        i_samp_end = min(n_samp_lead+n_samp_lag, i_samp_end)
+    
+    template_event_idx = template_event['event_index']
+    test_event_idxs = test_events['event_index'].values
+    
+    template_wf = wf_file[phase][template_event_idx, i_samp_start: i_samp_end]
+    template_start_time = wf_file[f'start_time_{phase}'][template_event_idx]
+    template_start_time += i_samp_start / sampling_rate
+
+    test_wfs = wf_file[phase][test_event_idxs]
+    test_start_times = wf_file[f'start_time_{phase}'][test_event_idxs]
+    
+    return template_wf, test_wfs, template_start_time, test_start_times
+
+
+def initialize_output(config, clargs):
+    out_file = config['general']['output_dir'].joinpath(
+        f'{clargs.network}.{clargs.station}.hdf5'
+    )
+    out_file.parent.mkdir(exist_ok=True, parents=True)
+    with h5py.File(out_file, mode='a') as out_file:
+        for phase in ('P', 'S'):
+            out_file.create_dataset(
+                f'/event_pair_ids/{phase}',
+                (0, 2),
+                maxshape=(None, 2),
+                dtype=np.int16
+            )
+            out_file.create_dataset(
+                f'/dt/{phase}',
+                (0,),
+                maxshape=(None,),
+                dtype=np.float64
+            )
+            out_file.create_dataset(
+                f'/cc_max/{phase}',
+                (0,),
+                maxshape=(None,),
+                dtype=np.float32
+            )
+        file_name = out_file.filename
+        
+    return file_name
+    
+
+def load_events(config):
+    events = pd.read_hdf(config['general']['catalog'], key='/events')
+    events = events.set_index('event_id')
+    events = events.sort_index()
+
+    return events
+
+
+def log_clargs(clargs):
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    logger.info('')
+    logger.info('***Command-line arguments***')
+    for arg in sorted(vars(clargs)):
+        logger.info(f'{arg}: {getattr(clargs, arg)}')
+    logger.info('')
+    
+    
+def log_config(config):
+    logger.info('')
+    logger.info('***Configuration***')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+    logger.info('')
+
+    
+if __name__ == '__main__':
+    main()

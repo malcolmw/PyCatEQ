@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+
+import argparse
+import configparser
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+import pathlib
+import pykonal
+import tqdm
+
+def parse_clargs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        default='200_REAL.cfg',
+        type=str,
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-n',
+        '--n_proc',
+        default=1,
+        type=int,
+        help='Number of processors.'
+    )
+
+    return (parser.parse_args())
+
+def parse_config(config_file):
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config = dict()
+    config['general'] = dict(
+        vp_path=pathlib.Path(parser.get('general', 'vp_path')).resolve(),
+        vs_path=pathlib.Path(parser.get('general', 'vs_path')).resolve(),
+        output_dir=pathlib.Path(parser.get('general', 'output_dir')).resolve(),
+        network_path=pathlib.Path(parser.get('general', 'network_path')).resolve()
+    )
+
+    return config
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    network = load_network(config)
+    with mp.Pool(
+        clargs.n_proc,
+        initializer=init_pool,
+        initargs=(config,)
+    ) as pool:
+        list(tqdm.tqdm(
+            pool.imap(target, network.iterrows()),
+            total=len(network)
+        ))
+    output_dir = config['general']['output_dir']
+    inventory = pykonal.inventory.TraveltimeInventory(
+        output_dir.joinpath('tt_inventory.hdf5'),
+        mode='w'
+    )
+    paths = filter(
+        lambda path: path.name != 'tt_inventory.hdf5',
+        output_dir.iterdir()
+    )
+    inventory.merge(paths)
+    inventory.f5.close()
+
+
+def apply_jitter(vv):
+    '''
+    Randomly jitter node locations by up to a half node interval to
+    mitigate grid artifacts.
+
+    Parameters
+    ----------
+    vv : pykonal.fields.ScalarField3D
+        Input model to jitter.
+
+    Returns
+    -------
+    new : pykonal.fields.ScalarField3D
+        Jittered field.
+    '''
+
+    rng = np.random.default_rng()
+
+    sign = np.sign(rng.normal(size=3))
+    size = rng.uniform(size=3) * vv.node_intervals / 2
+    jitter = sign * size
+    new = pykonal.fields.ScalarField3D(coord_sys=vv.coord_sys)
+    new.min_coords = vv.min_coords + jitter
+    new.node_intervals = vv.node_intervals
+    new.npts = vv.npts
+    new.values = vv.resample(new.nodes.reshape(-1, 3)).reshape(new.npts)
+    
+    return new
+
+
+def load_network(config):
+    network = pd.read_hdf(config['general']['network_path'], key='/network')
+    network = network.drop_duplicates(subset=['network', 'station'])
+    network = network.set_index(['network', 'station'])
+    network = network.sort_index()
+
+    return network
+
+def target(args):
+    global config
+    (network, station), row = args
+    longitude, latitude, elevation, depth = row[[
+        'longitude',
+        'latitude',
+        'elevation',
+        'depth'
+    ]]
+    depth = (depth - elevation)*1e-3
+    output_dir = config['general']['output_dir']
+    for phase in ('P', 'S'):
+        model_path = config['general'][f'v{phase.lower()}_path']
+        model = pykonal.fields.read_hdf(model_path)
+        #model = apply_jitter(model)
+        solver = pykonal.solver.PointSourceSolver(coord_sys=model.coord_sys)
+        for attr in ('min_coords', 'node_intervals', 'npts', 'values'):
+            setattr(solver.vv, attr, getattr(model, attr))
+        solver.src_loc = pykonal.transformations.geo2sph(np.array(
+            [latitude, longitude, depth]
+        ))
+        solver.solve()
+        path = output_dir.joinpath('.'.join((network, station, phase, 'hdf5')))
+        path.parent.mkdir(exist_ok=True, parents=True)
+        solver.tt.to_hdf(str(path))
+
+
+def init_pool(_config):
+    global config
+    config = _config
+
+if __name__ == "__main__":
+    main()
