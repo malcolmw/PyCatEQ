@@ -321,7 +321,6 @@ def populate_output(
                     endtime=end_time
                 )
             except Exception as error:
-                logger.error(f'{error.args}')
                 continue
             flag = True
             break

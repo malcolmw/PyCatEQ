@@ -1,10 +1,11 @@
-# USAGE: python 120_picks2real.py INPUT_FILE_0 [INPUT_FILE_1 [INPUT_FILE_2 [...]]] OUTPUT_DIR
+#!/usr/bin/env python
 
 import argparse
 import pandas as pd
 import pathlib
 import sys
 import tqdm
+import warnings; warnings.filterwarnings('ignore')
 
 def parse_clargs():
     parser = argparse.ArgumentParser()
