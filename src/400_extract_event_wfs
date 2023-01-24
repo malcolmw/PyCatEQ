@@ -246,7 +246,7 @@ def initialize_output(clargs, config, n_events):
         out_file.require_dataset(
             'event_id',
             shape=(n_events,),
-            dtype=np.int32,
+            dtype=h5py.string_dtype(),
             exact=True
         )
         out_file['P'].attrs['n_samp_lead']    = int(tlead_P * sampling_rate)
@@ -280,7 +280,9 @@ def populate_output(
     arrivals = arrivals.sort_values('event_id')
     arrivals = arrivals.set_index('event_id')
     sampling_rate = config['general']['sampling_rate']
-    event_ids = out_file['event_id'][:]
+    event_ids = pd.Series(out_file['event_id'][:])
+    event_ids = event_ids.str.decode('utf-8')
+    event_ids = event_ids.values
 
     for event_id, arrival in tqdm.tqdm(
             arrivals.iterrows(), 
@@ -372,7 +374,8 @@ def main():
             value = config[group][key]
             logger.info(f'{group}.{key}: {value}')
     events, arrivals = read_catalog(config['general']['catalog'])
-    event_ids = np.sort(np.unique(arrivals['event_id'].astype(int)))
+    #event_ids = np.sort(np.unique(arrivals['event_id'].astype(int)))
+    event_ids = np.sort(np.unique(arrivals['event_id']))
     
     path = initialize_output(clargs, config, len(event_ids))
     with h5py.File(path, mode='a') as out_file:
