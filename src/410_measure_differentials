@@ -82,7 +82,12 @@ def main_parallel(config, clargs):
         f'{clargs.network}.{clargs.station}.hdf5'
     )
     logger.info(wf_file)
-    out_file = initialize_output(config, clargs)
+
+    # Load the event database
+    events = load_events(config)
+    out_file = initialize_output(config, clargs, events.index)
+    id_map = pd.Series(np.arange(len(events)), index=events.index)
+
     with h5py.File(out_file, mode='a') as out_file:
         for phase in clargs.phases:
             logger.info(f'Cross-correlating {phase}-wave arrivals.')
@@ -97,20 +102,14 @@ def main_parallel(config, clargs):
                 initializer=init_correlate_event_parallel,
                 initargs=(events, config, wf_file)
             ) as pool:
-                for result in tqdm.tqdm(
+                for results in tqdm.tqdm(
                     pool.imap(
                         correlate_event_parallel,
                         ((phase, event) for event_id, event in events.iterrows())
                     ),
                     total=len(events)
                 ):
-                    for attr in ('dt', 'cc_max', 'event_pair_ids'):
-                        n_obs = len(result[attr])
-                        handle = f'/{attr}/{phase}'
-                        datas = out_file[handle]
-                        size = len(datas)
-                        datas.resize(size+n_obs, axis=0)
-                        datas[size: ] = result[attr]
+                    write_results(results, phase, out_file, id_map)
    
 def main_serial(config, clargs):
     logger.info('Processing data serially.')
@@ -118,7 +117,11 @@ def main_serial(config, clargs):
         f'{clargs.network}.{clargs.station}.hdf5'
     )
     logger.info(wf_file)
-    out_file = initialize_output(config, clargs)
+
+    # Load the event database
+    events = load_events(config)
+    out_file = initialize_output(config, clargs, events.index)
+    id_map = pd.Series(np.arange(len(events)), index=events.index)
     
     with (
             h5py.File(out_file, mode='a') as out_file, 
@@ -139,13 +142,21 @@ def main_serial(config, clargs):
                     config, 
                     wf_file,
                 )
-                for attr in ('dt', 'cc_max', 'event_pair_ids'):
-                    n_obs = len(results[attr])
-                    handle = f'/{attr}/{phase}'
-                    datas = out_file[handle]
-                    size = len(datas)
-                    datas.resize(size+n_obs, axis=0)
-                    datas[size: ] = results[attr]
+                write_results(results, phase, out_file, id_map)
+
+def write_results(results, phase, out_file, id_map):
+    n_obs = len(results['event_pair_ids'])
+    datas = out_file[f'/event_pair_ids/{phase}']
+    size = len(datas)
+    datas.resize(size+n_obs, axis=0)
+    datas[size: ] = results['event_pair_ids']
+    for i_result, event_pair in enumerate(results['event_pair_ids']):
+        event_id_A, event_id_B = min(event_pair), max(event_pair)
+        serial_id_A, serial_id_B = id_map[event_id_A], id_map[event_id_B]
+        dt = results['dt'][i_result]
+        cc = results['cc_max'][i_result]
+        out_file[f'/dt/{phase}'][serial_id_A, serial_id_B] = dt
+        out_file[f'/cc_max/{phase}'][serial_id_A, serial_id_B] = cc
                 
     
 def parse_clargs():
@@ -599,12 +610,18 @@ def get_waveforms(wf_file, phase, template_event, test_events, config):
     return template_wf, test_wfs, template_start_time, test_start_times
 
 
-def initialize_output(config, clargs):
+def initialize_output(config, clargs, event_ids):
     out_file = config['general']['output_dir'].joinpath(
         f'{clargs.network}.{clargs.station}.hdf5'
     )
     out_file.parent.mkdir(exist_ok=True, parents=True)
+    n_events = len(event_ids)
     with h5py.File(out_file, mode='a') as out_file:
+        out_file.create_dataset(
+            f'/event_ids',
+            data=event_ids,
+            dtype=h5py.string_dtype()
+        )
         for phase in clargs.phases:
             out_file.create_dataset(
                 f'/event_pair_ids/{phase}',
@@ -614,18 +631,22 @@ def initialize_output(config, clargs):
             )
             out_file.create_dataset(
                 f'/dt/{phase}',
-                (0,),
-                maxshape=(None,),
-                dtype=np.float64
+                (n_events, n_events),
+                maxshape=(None, None),
+                dtype=np.float64,
+                chunks=(32, 32),
+                compression=3
             )
             out_file.create_dataset(
                 f'/cc_max/{phase}',
-                (0,),
-                maxshape=(None,),
-                dtype=np.float32
+                (n_events, n_events),
+                maxshape=(None, None),
+                dtype=np.float32,
+                chunks=(32, 32),
+                compression=3
             )
         file_name = out_file.filename
-        
+
     return file_name
     
 
