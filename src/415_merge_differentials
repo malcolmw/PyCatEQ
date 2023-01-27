@@ -1,0 +1,205 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan 11 13:14:45 2023
+
+@author: malcolmw
+"""
+import argparse
+import configparser
+import h5py
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+import pathlib
+import sys
+import tqdm
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def main():
+    clargs = parse_clargs()
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    log_clargs(clargs)
+    events, stations = load_catalog(clargs.catalog)
+    n_events = len(events)
+    n_stations = len(stations)
+    with h5py.File(clargs.path_out, mode='a') as out_file:
+        out_file.create_dataset(
+            '/stations',
+            data=np.array([[*station] for station in stations], dtype='S'),
+            dtype=h5py.string_dtype()
+        )
+        cc_out = out_file.create_dataset(
+            '/cc_max',
+            shape=(n_events, n_events, n_stations, 2),
+            maxshape=(None, None, None, 2),
+            chunks=(2, 2, 8, 2),
+            dtype=np.float32,
+            compression=clargs.compression
+        )
+        dt_out = out_file.create_dataset(
+            '/dt',
+            shape=(n_events, n_events, n_stations, 2),
+            maxshape=(None, None, None, 2),
+            chunks=(2, 2, 8, 2),
+            dtype=np.float64,
+            compression=clargs.compression
+        )
+        for path in sorted(pathlib.Path(clargs.input_dir).glob('*.*.hdf5')):
+            network, station, _ = path.name.split('.')
+            i_station = list(stations).index((network, station))
+            with h5py.File(path, mode='r') as in_file:
+                serial_id_map = pd.Series(
+                    np.arange(len(in_file[f'/event_ids'])),
+                    index=in_file[f'/event_ids'][:]
+                )
+            for i_phase, phase in enumerate(('P', 'S')):
+                with h5py.File(path, mode='r') as in_file:
+                    event_pairs = in_file[f'/event_pair_ids/{phase}'][:]
+                initargs=(serial_id_map, path, phase)
+                with mp.Pool(
+                    clargs.n_proc,
+                    initializer=init_parallel_reader,
+                    initargs=initargs
+                ) as pool:
+                    out = pool.map(
+                        parallel_reader,
+                        np.array_split(event_pairs, clargs.n_proc)
+                    )
+                dataf = pd.concat(out, ignore_index=True)
+                dataf['serial_id_A'] = serial_id_map[
+                    dataf['template_event_id'].values
+                ].values
+                dataf['serial_id_B'] = serial_id_map[
+                    dataf['test_event_id'].values
+                ].values
+                dataf = dataf.sort_values(['serial_id_A', 'serial_id_B'])
+                dataf = dataf.set_index('serial_id_A')
+
+                pbar = tqdm.tqdm(
+                    total=len(dataf),
+                    position=0,
+                    leave=True,
+                    desc=f'{network}.{station}.{phase}',
+                    ncols=80
+                )
+                for serial_id_A in dataf.index.unique()[:100]:
+                    dataf_ = dataf.loc[[serial_id_A]]
+                    cc_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['cc'].values
+                    dt_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['dt'].values
+                    pbar.update(len(dataf_))
+
+
+def init_parallel_reader(serial_id_map_, path, phase):
+    global serial_id_map
+    global cc_in
+    global dt_in
+    serial_id_map = serial_id_map_
+    file = h5py.File(path, mode='r')
+    cc_in = file[f'/cc_max/{phase}']
+    dt_in = file[f'/dt/{phase}']
+
+
+def load_catalog(path):
+    events = pd.read_hdf(path, key='/events')
+    events = events.set_index('event_id')
+    events = events.sort_index()
+    logger.info(f'Loaded {len(events):,d} events.')
+
+    arrivals = pd.read_hdf(path, key='/arrivals')
+    arrivals = arrivals.set_index(['network', 'station'])
+    stations = np.sort(arrivals.index.unique())
+    logger.info(f'Loaded {len(stations):,d} stations.')
+
+    return events, stations
+
+
+def parallel_reader(event_pairs):
+    global serial_id_map
+    global cc_in
+    global dt_in
+    cc_out, dt_out = list(), list()
+    for event_pair in event_pairs:
+        event_id_A, event_id_B = min(event_pair), max(event_pair)
+        serial_id_A = serial_id_map[event_id_A]
+        serial_id_B = serial_id_map[event_id_B]
+        idx_in = (serial_id_A, serial_id_B)
+        cc_out.append(cc_in[idx_in])
+        dt_out.append(dt_in[idx_in])
+
+    return pd.DataFrame(dict(
+        cc=cc_out,
+        dt=dt_out,
+        template_event_id=event_pairs[:, 0],
+        test_event_id=event_pairs[:, 1]
+    ))
+
+    
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'input_dir',
+        type=str,
+        help='Input directory to merge.'
+    )
+    parser.add_argument(
+        'catalog',
+        type=str,
+        help='Input catalog.'
+    )
+    parser.add_argument(
+        'path_out',
+        type=str,
+        help='Output path.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-n',
+        '--n_proc',
+        type=int,
+        default=4,
+        help='Number of reader processes (default=4).'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    parser.add_argument(
+        '-z',
+        '--compression',
+        type=int,
+        default=3,
+        help='Compression level (default=3).'
+    )
+    clargs = parser.parse_args()
+
+    return clargs
+
+
+def log_clargs(clargs):
+    logger.info('***Command-line arguments***')
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    
+    
+if __name__ == '__main__':
+    main()
