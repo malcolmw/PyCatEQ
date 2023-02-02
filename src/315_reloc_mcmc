@@ -1,0 +1,382 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# """
+# Created on Wed Jan 11 13:14:45 2023
+
+# @author: malcolmw
+# """
+import argparse
+import configparser
+import emcee
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+import pathlib
+import pykonal
+import scipy.special
+import sys
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    log_clargs(clargs)
+    log_config(config)
+    
+    events, arrivals = load_events(config['general']['input_file'], clargs)
+    locate_events(events, arrivals, clargs, config)
+    
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        'output_path',
+        type=str,
+        help='Output file path.'
+    )
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        type=str,
+        default=f'{sys.argv[0]}.cfg',
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-e',
+        '--end_date',
+        type=str,
+        default=None,
+        help='End date.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-n',
+        '--n_proc',
+        type=int,
+        default=8,
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-s',
+        '--start_date',
+        type=str,
+        default=None,
+        help='Start date.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    clargs = parser.parse_args()
+
+    return clargs
+
+
+def parse_config(config_file):
+    config = dict()
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config['general'] = dict(
+        input_file=pathlib.Path(parser.get('general', 'input_file')).resolve(),
+        tt_inv_path=pathlib.Path(parser.get('general', 'tt_inv_path')).resolve()
+    )
+    config['uncertainty'] = dict(
+        model=pathlib.Path(parser.get('uncertainty', 'model')).resolve(),
+        
+    )
+    config['algorithm'] = dict(
+        confidence_level=parser.getfloat('algorithm', 'confidence_level', fallback=90.),
+        n_walkers=parser.getint('algorithm', 'n_walkers', fallback=8),
+        n_samples=parser.getint('algorithm', 'n_samples', fallback=1024),
+        max_samples=parser.getint('algorithm', 'max_samples', fallback=32768),
+    )
+
+    return config
+
+def log_clargs(clargs):
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    logger.info('')
+    logger.info('***Command-line arguments***')
+    for arg in sorted(vars(clargs)):
+        logger.info(f'{arg}: {getattr(clargs, arg)}')
+    logger.info('')
+    
+    
+def log_config(config):
+    logger.info('')
+    logger.info('***Configuration***')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+    logger.info('')
+    
+
+class VoigtProfile(object):
+    def __init__(self, mu=0, sigma=1, gamma=1):
+        self.mu    = mu
+        self.sigma = sigma
+        self.gamma = gamma
+
+    def logpdf(self, x):
+        return np.log(scipy.special.voigt_profile(
+            x - self.mu, 
+            self.sigma, 
+            self.gamma
+        ))
+    
+def arrival_dict(arrivals):
+    return dict(zip(
+        arrivals.index, 
+        arrivals['time']
+    ))
+    
+def load_events(path, clargs):
+    events = pd.read_hdf(path, key='/events')
+    if clargs.start_date is not None:
+        events = events[
+            events['time'] >= pd.to_datetime(clargs.start_date, utc=True)
+        ]
+    if clargs.end_date is not None:
+        events = events[
+            events['time'] <= pd.to_datetime(clargs.end_date, utc=True)
+        ]
+    events = events.set_index('event_id')
+    events = events.sort_index()
+    events['time'] = events['time'].map(lambda time: time.timestamp())
+    
+    arrivals = pd.read_hdf(path, key='/arrivals')
+    arrivals = arrivals.set_index(['event_id', 'network', 'station', 'phase'])
+    arrivals = arrivals.sort_index()
+    arrivals = arrivals.loc[events.index]
+    arrivals['time'] = arrivals['time'].map(lambda time: time.timestamp())
+    
+    return events, arrivals
+
+
+def load_pick_errors(path):
+    pick_errors = pd.read_hdf(path, key='/pick_errors')
+    pick_errors = pick_errors.set_index(['network', 'station', 'phase'])
+    pick_errors = pick_errors.sort_index()
+    
+    return pick_errors
+
+def load_residual_errors(path):
+    pick_errors = pd.read_hdf(path, key='/residual_errors')
+    pick_errors = pick_errors.set_index(['network', 'station', 'phase'])
+    pick_errors = pick_errors.sort_index()
+    
+    return pick_errors
+
+def locate_events(events, arrivals, clargs, config):
+    global locator
+
+    path = str(config['general']['tt_inv_path'])
+    
+    relocated_events = pd.DataFrame()
+    
+    with pykonal.locate.EQLocator(path) as locator:
+        locator.residual_rvs = load_residual_rvs(config)
+        logger.info(
+            f'Relocating {len(events):,d} events between '
+            f'{pd.to_datetime(events["time"].min()*1e9)} and '
+            f'{pd.to_datetime(events["time"].max()*1e9)}.'
+        )
+        for event_id, event in events.iterrows():
+            event = locate_event(
+                locator, 
+                event,
+                arrivals.loc[event_id], 
+                clargs, 
+                config
+            )
+            relocated_events = pd.concat(
+                [relocated_events, event], 
+                ignore_index=True
+            )
+            relocated_events.to_hdf(clargs.output_path, key='/events')
+        logger.info(f'Finished relocating {len(relocated_events):,d} events.')
+    return relocated_events
+            
+            
+def locate_event(locator, event, arrivals, clargs, config):
+    
+    n_walkers   = config['algorithm']['n_walkers']
+    n_samples   = config['algorithm']['n_samples']
+    max_samples = config['algorithm']['max_samples']
+    n_dim       = 4
+    converged   = False
+    
+    locator.clear_arrivals()
+    locator.add_arrivals(arrival_dict(arrivals))
+    locator.read_traveltimes()
+    
+    logger.info(
+        f'Locating event ID# {event.name} '
+        f'{len(locator.arrivals)} arrivals'
+    )
+    lat_0, lon_0, z_0, t_0 = event[['latitude', 'longitude', 'depth', 'time']]
+    logger.debug(
+        f'Initial location: {lat_0:.3f}, {lon_0:.3f}, {z_0:.2f}, '
+        f'{pd.to_datetime(t_0*1e9, utc=True)}'
+    )
+
+    hypo_0 = pykonal.transformations.geo2sph(
+        event[['latitude', 'longitude', 'depth']]
+    )
+    hypo_0 = np.append(hypo_0, event['time'])
+    pos = np.zeros((n_walkers, 4))
+    # TODO: This should probably be moved to the config file
+    pos[:, 0] = hypo_0[0] + np.random.randn(n_walkers)
+    pos[:, 1:3] = hypo_0[1:3] + 1e-4*np.random.randn(n_walkers, 2)
+    pos[:, 3] = hypo_0[3] + np.random.randn(n_walkers)
+    
+    with mp.Pool(clargs.n_proc) as pool:
+        sampler = emcee.EnsembleSampler(
+            n_walkers,
+            n_dim,
+            log_probability,
+            pool=pool,
+            moves=[emcee.moves.DEMove()]
+        )
+        chain_size = 0
+        while chain_size <= max_samples:
+            sampler.run_mcmc(pos, n_samples, progress=True)
+            try:
+                tau = np.max(np.mean(sampler.get_autocorr_time()))
+                chain = sampler.get_chain(
+                    discard=int(5*tau),
+                    thin=int(tau/2),
+                    flat=True
+                )
+                posterior = sampler.get_log_prob(
+                    discard=int(5*tau),
+                    thin=int(tau/2),
+                    flat=True
+                )
+                posterior = np.exp(posterior)
+                logger.info(tau)
+            except (emcee.autocorr.AutocorrError, ValueError) as exc:
+                chain_size = sampler.chain.shape[1]
+                continue
+            converged = True
+            break
+    # plot(sampler)
+    cov_labels = [
+        f'cov_{i}{j}' 
+        for i, j 
+        in zip(*np.unravel_index(np.arange(16), (4, 4)))
+    ]
+    if converged is True:
+        chain[:, :3] = pykonal.transformations.sph2geo(chain[:, :3])
+        # Compute the expected value
+        mu = np.average(chain, axis=0, weights=posterior)
+        # And the covariance matrix
+        cov = np.cov(chain, rowvar=False)
+        return pd.DataFrame(
+            [[event.name, 'mcmc', converged, *mu, *cov.flatten()]], 
+            columns=[
+                'event_id', 
+                'algorithm',
+                'converged',
+                'latitude', 
+                'longitude', 
+                'depth', 
+                'time',
+                *cov_labels
+            ]
+        )
+    else:
+        mu = [lat_0, lon_0, z_0, t_0]
+        cov = np.inf * np.ones((4, 4))
+        return pd.DataFrame(
+            [[event.name, 'mcmc', converged, *mu, *cov.flatten()]], 
+            columns=[
+                'event_id', 
+                'algorithm',
+                'converged',
+                'latitude', 
+                'longitude', 
+                'depth', 
+                'time',
+                *cov_labels
+            ]
+        )
+
+def plot(sampler):
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    
+    chain = sampler.flatchain.copy()
+    chain[:, :3] = pykonal.transformations.sph2geo(chain[:, :3])
+    fig, ax = plt.subplots()
+    ax.hist2d(
+        chain[:, 1], 
+        chain[:, 0],
+        norm=mpl.colors.LogNorm(),
+        bins=120
+    )
+    plt.show()
+    
+def load_residual_rvs(config):
+    import scipy.stats
+    pick_errors = load_pick_errors(config['uncertainty']['model'])
+    residual_errors = load_residual_errors(config['uncertainty']['model'])
+
+    # TODO: How does mu add?
+    residual_rvs = {
+        index: VoigtProfile(
+            mu=pick_errors.loc[index, 'loc']+residual_errors.loc[index, 'loc'],
+            sigma=residual_errors.loc[index, 'scale'],
+            gamma=pick_errors.loc[index, 'scale']
+        )
+        for index in pick_errors.index.append(residual_errors.index).unique()
+    }
+        
+    return residual_rvs
+    
+    
+
+
+def log_probability(args):
+    global locator
+
+    rho, theta, phi, time = args
+
+    log_likelihood = locator.log_likelihood(args)
+
+    if np.isnan(log_likelihood):
+        return -np.inf
+    else:
+        log_prior = np.log(rho**2 + np.sin(theta))
+        return log_likelihood + log_prior
+    
+
+
+
+if __name__ == '__main__':
+    main()
