@@ -279,7 +279,6 @@ def locate_event(locator, event, arrivals, clargs, config):
                     flat=True
                 )
                 posterior = np.exp(posterior)
-                logger.info(tau)
             except (emcee.autocorr.AutocorrError, ValueError) as exc:
                 chain_size = sampler.chain.shape[1]
                 continue
