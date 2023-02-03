@@ -4,6 +4,8 @@
 Created on Wed Jan 11 13:14:45 2023
 
 @author: malcolmw
+
+- event_pair_ids will be in (template_event_id, test_event_id) order.
 """
 import argparse
 import configparser
@@ -49,7 +51,24 @@ def main():
     global ndimage
 
     clargs = parse_clargs()
+    ##############
+    # SPYDER START
+    ##############
+    clargs.config_file='/home/malcolmw/git/PyCatEQ/cfg/410_measure_differentials.cfg'
+    clargs.network = 'AZ'
+    clargs.station = 'BZN'
+    ##############
+    # SPYDER END
+    ##############
     config = parse_config(clargs.config_file)
+    ##############
+    # SPYDER START
+    ##############
+    for path in config['general']['output_dir'].iterdir():
+        path.unlink()
+    ##############
+    # SPYDER END
+    ##############
     my_logging.configure_logger(
         __name__,
         clargs.log_file,
@@ -121,12 +140,13 @@ def main_serial(config, clargs):
     # Load the event database
     events = load_events(config)
     out_file = initialize_output(config, clargs, events.index)
-    id_map = pd.Series(np.arange(len(events)), index=events.index)
     
     with (
             h5py.File(out_file, mode='a') as out_file, 
             h5py.File(wf_file, mode='r') as wf_file
     ):
+        event_ids = wf_file['event_id'][:].astype(str)
+        id_map = pd.Series(np.arange(len(event_ids)), index=event_ids)
         for phase in clargs.phases:
             logger.info(f'Cross-correlating {phase}-wave arrivals.')
             # Load the event database
@@ -165,16 +185,16 @@ def parse_clargs():
     '''
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        'network',
-        type=str,
-        help='Network code.'
-    )
-    parser.add_argument(
-        'station',
-        type=str,
-        help='Station code.'
-    )
+    # parser.add_argument(
+    #     'network',
+    #     type=str,
+    #     help='Network code.'
+    # )
+    # parser.add_argument(
+    #     'station',
+    #     type=str,
+    #     help='Station code.'
+    # )
     parser.add_argument(
         '-c',
         '--config_file',
@@ -353,8 +373,18 @@ def correlate_event_parallel(args):
         sorted_pair_ids=selected_pair_ids
     )
 
+def plot(X_template, X_test):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    ax.plot(X_test[-1]);
+    plt.show()
+    
+
 def correlate_event_serial(phase, event, events, config, wf_file):
     n_pairs = config['general']['n_pairs']
+    
+    # Only consider events that occurred earlier in time.
+    events = events[events['time'] < event['time']].copy()
 
     # Sort events by distance from template event
     sorted_events = dist_sort(
@@ -369,6 +399,7 @@ def correlate_event_serial(phase, event, events, config, wf_file):
         n_pairs,
     )
     selected_events = selected_events.sort_index()
+    
     
     # Get the waveforms
     X_template, X_test, template_start_time, test_start_times = get_waveforms(
@@ -400,11 +431,8 @@ def correlate_event_serial(phase, event, events, config, wf_file):
     lag -= n_samp//2 + n_samp%2
 
     sampling_rate = wf_file[phase].attrs['sampling_rate']
-    #tlead = wf_file[phase].attrs['n_samp_lead'] / sampling_rate
-    #template_tlead = config['waveforms'][f'template_tlead_{phase}']
     dt  = (test_start_times - template_start_time[xp.newaxis])
     dt += lag / sampling_rate
-    #dt += (tlead - template_tlead) - lag / sampling_rate
     dt  = xp.sum(dt * xp.abs(cc_max), axis=-1)
     dt /= xp.sum(xp.abs(cc_max), axis=-1)
     cc_max = xp.mean(cc_max, axis=-1)
@@ -480,7 +508,7 @@ def normalize(X, axis=0):
 def select_events(event, sorted_events, n_pairs):
     
     # Form a list of event pair IDs for the sorted events.
-    pairs = form_pairs(event.name, sorted_events.index.values)
+    #pairs = form_pairs(event.name, sorted_events.index.values)
 
     # TODO:: Retain only the sorted events that have not already been 
     # correlated against the template event.
@@ -519,7 +547,7 @@ def sliding_window(X, window_length, axis=0):
 
 def dist_sort(events, event, max_dist=None):
 
-    events = events.drop(index=event.name)
+    # events = events.drop(index=event.name)
     
     geod = pyproj.Geod(ellps='WGS84')
     az, baz, dist = geod.inv(
@@ -562,11 +590,9 @@ def form_pairs(template_event_id, test_event_ids, sort=True):
 
 
 def select_events_with_waveforms(events, wf_file, phase):
-    event_ids = pd.Series(wf_file['event_id'][:])
-    event_ids = event_ids.str.decode('utf-8')
-    event_ids = event_ids.values
-    event_idx_lookup = pd.Series(
-        range(len(event_ids)),
+    event_ids = wf_file['event_id'][:].astype(str)
+    array_index_map = pd.Series(
+        np.arange(len(event_ids)),
         index=event_ids
     )
     mask = wf_file[f'mask_{phase}'][:]
@@ -574,7 +600,7 @@ def select_events_with_waveforms(events, wf_file, phase):
     # Just events with waveforms
     events = events.loc[event_ids]
     # Assign lookup index.
-    events['event_index'] = event_idx_lookup[event_ids]
+    events['array_index'] = array_index_map[event_ids]
     
     return events
 
@@ -597,8 +623,8 @@ def get_waveforms(wf_file, phase, template_event, test_events, config):
         i_samp_start = max(0, i_samp_start)
         i_samp_end = min(n_samp_lead+n_samp_lag, i_samp_end)
     
-    template_event_idx = template_event['event_index']
-    test_event_idxs = test_events['event_index'].values
+    template_event_idx = template_event['array_index']
+    test_event_idxs = test_events['array_index'].values
     
     template_wf = wf_file[phase][template_event_idx, i_samp_start: i_samp_end]
     template_start_time = wf_file[f'start_time_{phase}'][template_event_idx]
