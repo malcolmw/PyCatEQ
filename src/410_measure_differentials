@@ -4,10 +4,13 @@
 Created on Wed Jan 11 13:14:45 2023
 
 @author: malcolmw
+
+- event_pairs will be in (template_event_id, test_event_id) order.
 """
 import argparse
 import configparser
 import h5py
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
 import pathlib
@@ -28,7 +31,7 @@ try:
     get_array_module = cp.get_array_module
     asnumpy = cp.asnumpy
     DEVICE_COUNT = cp.cuda.runtime.getDeviceCount()
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     DEVICE_COUNT = 0
 
 if DEVICE_COUNT < 1:
@@ -69,90 +72,70 @@ def main():
     log_clargs(clargs)
     log_config(config)
 
-    if (clargs.gpu is False or DEVICE_COUNT < 1) and clargs.n_proc > 1:
-        main_parallel(config, clargs)
-    else:
-        main_serial(config, clargs)
-
-
-def main_parallel(config, clargs):
-    import multiprocessing as mp
-    logger.info(f'Processing data in parallel using {clargs.n_proc} CPUs.')
-    wf_file = config['general']['input_dir'].joinpath(
+    wf_path = config['general']['input_dir'].joinpath(
         f'{clargs.network}.{clargs.station}.hdf5'
     )
-    logger.info(wf_file)
 
     # Load the event database
     events = load_events(config)
+    logger.debug(f'{len(events)} events loaded.')
     out_file = initialize_output(config, clargs, events.index)
-    id_map = pd.Series(np.arange(len(events)), index=events.index)
-
-    with h5py.File(out_file, mode='a') as out_file:
-        for phase in clargs.phases:
-            logger.info(f'Cross-correlating {phase}-wave arrivals.')
-            # Load the event database
-            events = load_events(config)
-            # Discard events without waveforms
-            with h5py.File(wf_file, mode='r') as _wf_file:
-                events = select_events_with_waveforms(events, _wf_file, phase)
-
-            with mp.Pool(
-                clargs.n_proc,
-                initializer=init_correlate_event_parallel,
-                initargs=(events, config, wf_file)
-            ) as pool:
-                for results in tqdm.tqdm(
-                    pool.imap(
-                        correlate_event_parallel,
-                        ((phase, event) for event_id, event in events.iterrows())
-                    ),
-                    total=len(events)
-                ):
-                    write_results(results, phase, out_file, id_map)
-   
-def main_serial(config, clargs):
-    logger.info('Processing data serially.')
-    wf_file = config['general']['input_dir'].joinpath(
-        f'{clargs.network}.{clargs.station}.hdf5'
-    )
-    logger.info(wf_file)
-
-    # Load the event database
-    events = load_events(config)
-    out_file = initialize_output(config, clargs, events.index)
-    id_map = pd.Series(np.arange(len(events)), index=events.index)
     
     with (
             h5py.File(out_file, mode='a') as out_file, 
-            h5py.File(wf_file, mode='r') as wf_file
+            h5py.File(wf_path, mode='r') as wf_file
     ):
+        event_ids = wf_file['event_id'][:].astype(str)
+        #serial_id_map = pd.Series(np.arange(len(event_ids)), index=event_ids)
+        serial_id_map = pd.Series(np.arange(len(events)), index=events.index)
         for phase in clargs.phases:
             logger.info(f'Cross-correlating {phase}-wave arrivals.')
             # Load the event database
             events = load_events(config)
             # Discard events without waveforms
             events = select_events_with_waveforms(events, wf_file, phase)
-            
-            for event_id, event in tqdm.tqdm(events.iterrows(), total=len(events)):
-                results = correlate_event_serial(
-                    phase,
-                    event, 
-                    events, 
-                    config, 
-                    wf_file,
-                )
-                write_results(results, phase, out_file, id_map)
 
-def write_results(results, phase, out_file, id_map):
-    n_obs = len(results['event_pair_ids'])
-    datas = out_file[f'/event_pair_ids/{phase}']
+            if (clargs.gpu is False or DEVICE_COUNT < 1) and clargs.n_proc > 1:
+                with mp.Pool(
+                    clargs.n_proc,
+                    initializer=init_mp,
+                    initargs=(events, config, wf_path)
+                ) as pool:
+                    generator = (
+                        (phase, event) 
+                        for event_id, event in events.iterrows()
+                    )
+                    for results in tqdm.tqdm(
+                        pool.imap(correlate_event, generator),
+                        total=len(events)
+                    ):
+                    #for results in pool.imap(correlate_event, generator):
+                        write_results(results, phase, out_file, serial_id_map)
+            else:
+                for event_id, event in tqdm.tqdm(
+                    events.iterrows(), 
+                    total=len(events)
+                ):
+                    results = correlate_event((
+                        phase,
+                        event, 
+                        events, 
+                        config, 
+                        wf_file,
+                    ))
+                    write_results(results, phase, out_file, serial_id_map)
+
+
+def write_results(results, phase, out_file, serial_id_map):
+    n_obs = len(results['event_pairs'])
+    datas = out_file[f'/event_pairs/{phase}']
     size = len(datas)
     datas.resize(size+n_obs, axis=0)
-    datas[size: ] = results['event_pair_ids']
-    for i_result, event_pair in enumerate(results['event_pair_ids']):
-        event_id_A, event_id_B = min(event_pair), max(event_pair)
-        serial_id_A, serial_id_B = id_map[event_id_A], id_map[event_id_B]
+    datas[size: ] = results['event_pairs']
+    for i_result, event_pair in enumerate(results['event_pairs']):
+        event_id_A, event_id_B = event_pair
+        serial_id_A = serial_id_map[event_id_A]
+        serial_id_B = serial_id_map[event_id_B]
         dt = results['dt'][i_result]
         cc = results['cc_max'][i_result]
         out_file[f'/dt/{phase}'][serial_id_A, serial_id_B] = dt
@@ -215,7 +198,7 @@ def parse_clargs():
         '-p',
         '--phases',
         type=str,
-        default=f'PS',
+        default='PS',
         help='Phase(s) to process.'
     )
     parser.add_argument(
@@ -257,21 +240,33 @@ def parse_config(config_file):
     return config
 
 
-def init_correlate_event_parallel(_events, _config, _wf_file):
-    global events
+def init_mp(_events, _config, _wf_file):
+    global all_events
     global config
     global wf_file
-    events = _events.copy()
+
+    all_events = _events.copy()
     config = _config
     wf_file = h5py.File(_wf_file, mode='r')
 
 
-def correlate_event_parallel(args):
-    global events
-    global config
-    global wf_file
-    phase, event = args
+def correlate_event(args):
+    if len(args) == 2:
+        # Running in parallel mode, so use global variables.
+        global all_events
+        global config
+        global wf_file
+        phase, event = args
+    else:
+        # Running in serial
+        phase, event, all_events, config, wf_file = args
+
     n_pairs = config['general']['n_pairs']
+    
+    # Only consider events that occurred earlier in time.
+    events = all_events[all_events['time'] < event['time']].copy()
+
+    logger.debug(f'{len(events)} candidate events for correlation against {event.name}')
 
     # Sort events by distance from template event
     sorted_events = dist_sort(
@@ -286,6 +281,9 @@ def correlate_event_parallel(args):
         n_pairs,
     )
     selected_events = selected_events.sort_index()
+
+    logger.debug(f'Correlating event {event.name} with {len(selected_events)} events.')
+    
     
     # Get the waveforms
     X_template, X_test, template_start_time, test_start_times = get_waveforms(
@@ -297,7 +295,6 @@ def correlate_event_parallel(args):
     )
     
     # DO the correlation
-    # For now, just run on GPU.
     X_template = xp.array(X_template)
     X_test = xp.array(X_test)
     test_start_times = xp.array(test_start_times)
@@ -308,30 +305,31 @@ def correlate_event_parallel(args):
         lag = xp.argmax(xp.abs(xcorr), axis=1)
     else:
         lag = xp.argmax(xcorr, axis=1)
+    # Extract the maximum xcorr value along the time axis for each trace
     i0 = np.repeat(np.arange(len(lag)), 3)
     i1 = lag.flatten()
     i2 = np.tile(np.arange(3), len(lag))
     cc_max = xcorr[i0, i1, i2].reshape(-1, 3)
+    
+    # Extract the maximum xcorr value along the channel axis for each
+    # event.
+    if config['correlation']['absolute'] is True:
+        i1 = xp.argmax(xp.abs(cc_max), axis=-1)
+    else:
+        i1 = xp.argmax(cc_max, axis=-1)
+    i0 = np.arange(len(i1))
+    cc_max = cc_max[i0, i1]
+    lag = lag[i0, i1]
 
     n_samp = X_template.shape[0]
     lag -= n_samp//2 + n_samp%2
 
     sampling_rate = wf_file[phase].attrs['sampling_rate']
-    #tlead = wf_file[phase].attrs['n_samp_lead'] / sampling_rate
-    #template_tlead = config['waveforms'][f'template_tlead_{phase}']
-    dt  = (test_start_times - template_start_time[xp.newaxis])
+    dt  = test_start_times[i0, i1] - template_start_time[i1]
     dt += lag / sampling_rate
-    #dt += (tlead - template_tlead) - lag / sampling_rate
-    dt  = xp.sum(dt * xp.abs(cc_max), axis=-1)
-    dt /= xp.sum(xp.abs(cc_max), axis=-1)
-    cc_max = xp.mean(cc_max, axis=-1)
 
-    event_pair_ids = form_pairs(
-        event.name, 
-        selected_events.index, 
-        sort=False
-    )
-    event_pair_ids = np.asarray(list(event_pair_ids))
+    event_pairs = form_pairs(event.name, selected_events.index)
+    event_pairs = np.asarray(list(event_pairs))
 
     # Discard measurements below threshold.
     thresh = config['correlation']['threshold']
@@ -344,100 +342,21 @@ def correlate_event_parallel(args):
         idxs = np.nonzero(cc_max >= thresh)
     dt = dt[idxs]
     cc_max = cc_max[idxs]
-    event_pair_ids = event_pair_ids[idxs]
+    event_pairs = event_pairs[idxs]
+
+    logger.debug(f'{event.name} correlated with {len(idxs)} events.')
 
     return dict(
         dt=dt, 
         cc_max=cc_max,
-        event_pair_ids=event_pair_ids,
+        event_pairs=event_pairs,
         sorted_pair_ids=selected_pair_ids
     )
 
-def correlate_event_serial(phase, event, events, config, wf_file):
-    n_pairs = config['general']['n_pairs']
-
-    # Sort events by distance from template event
-    sorted_events = dist_sort(
-        events, 
-        event, 
-        max_dist=config['general']['max_dist']
-    )
-    
-    selected_events, selected_pair_ids = select_events(
-        event,
-        sorted_events,
-        n_pairs,
-    )
-    selected_events = selected_events.sort_index()
-    
-    # Get the waveforms
-    X_template, X_test, template_start_time, test_start_times = get_waveforms(
-        wf_file,
-        phase,
-        event,
-        selected_events,
-        config
-    )
-    
-    # DO the correlation
-    # For now, just run on GPU.
-    X_template = xp.array(X_template)
-    X_test = xp.array(X_test)
-    test_start_times = xp.array(test_start_times)
-    template_start_time = xp.array(template_start_time)
-    xcorr = correlate_wfs(X_template, X_test)
-
-    if config['correlation']['absolute'] is True:
-        lag = xp.argmax(xp.abs(xcorr), axis=1)
-    else:
-        lag = xp.argmax(xcorr, axis=1)
-    i0 = np.repeat(np.arange(len(lag)), 3)
-    i1 = lag.flatten()
-    i2 = np.tile(np.arange(3), len(lag))
-    cc_max = xcorr[i0, i1, i2].reshape(-1, 3)
-
-    n_samp = X_template.shape[0]
-    lag -= n_samp//2 + n_samp%2
-
-    sampling_rate = wf_file[phase].attrs['sampling_rate']
-    #tlead = wf_file[phase].attrs['n_samp_lead'] / sampling_rate
-    #template_tlead = config['waveforms'][f'template_tlead_{phase}']
-    dt  = (test_start_times - template_start_time[xp.newaxis])
-    dt += lag / sampling_rate
-    #dt += (tlead - template_tlead) - lag / sampling_rate
-    dt  = xp.sum(dt * xp.abs(cc_max), axis=-1)
-    dt /= xp.sum(xp.abs(cc_max), axis=-1)
-    cc_max = xp.mean(cc_max, axis=-1)
-
-    event_pair_ids = form_pairs(
-        event.name, 
-        selected_events.index, 
-        sort=False
-    )
-    event_pair_ids = np.asarray(list(event_pair_ids))
-
-    # Discard measurements below threshold.
-    thresh = config['correlation']['threshold']
-    absolute = config['correlation']['absolute']
-    dt = asnumpy(dt)
-    cc_max = asnumpy(cc_max)
-    if absolute is True:
-        idxs = np.nonzero(np.abs(cc_max) >= thresh)
-    else:
-        idxs = np.nonzero(cc_max >= thresh)
-    dt = dt[idxs]
-    cc_max = cc_max[idxs]
-    event_pair_ids = event_pair_ids[idxs]
-
-    return dict(
-        dt=dt, 
-        cc_max=cc_max,
-        event_pair_ids=event_pair_ids,
-        sorted_pair_ids=selected_pair_ids
-    )
 
 
 def correlate_wfs(X_template, X_test):
+    
     xp = get_array_module(X_template)
 
     X_template = normalize(X_template, axis=0)
@@ -464,6 +383,7 @@ def correlate_wfs(X_template, X_test):
 
     
 def normalize(X, axis=0):
+    
     xp = get_array_module(X)
     mu = xp.mean(X, axis=axis)
     inds = [slice(None) for i in range(X.ndim)]
@@ -479,12 +399,6 @@ def normalize(X, axis=0):
     
 def select_events(event, sorted_events, n_pairs):
     
-    # Form a list of event pair IDs for the sorted events.
-    pairs = form_pairs(event.name, sorted_events.index.values)
-
-    # TODO:: Retain only the sorted events that have not already been 
-    # correlated against the template event.
-
     # Retain only the n_pairs nearest neighbours.
     selected_events = sorted_events.iloc[:n_pairs]
 
@@ -495,6 +409,7 @@ def select_events(event, sorted_events, n_pairs):
 
 
 def sliding_window(X, window_length, axis=0):
+    
     xp = get_array_module(X)
     n_pad = window_length // 2
     odd_bit = window_length % 2
@@ -518,8 +433,6 @@ def sliding_window(X, window_length, axis=0):
 
 
 def dist_sort(events, event, max_dist=None):
-
-    events = events.drop(index=event.name)
     
     geod = pyproj.Geod(ellps='WGS84')
     az, baz, dist = geod.inv(
@@ -541,40 +454,29 @@ def dist_sort(events, event, max_dist=None):
     return events
 
 
-def form_pairs(template_event_id, test_event_ids, sort=True):
+def form_pairs(template_event_id, test_event_ids):
     # Form a list of event pair IDs for the sorted events.
-    pairs = np.stack([
-        np.repeat(template_event_id, len(test_event_ids)), 
-        test_event_ids
-    ])
-
-    if sort is True:
-        # Order event pair IDs
-        pairs = np.stack([
-            np.min(pairs, axis=0), 
-            np.max(pairs, axis=0)
-        ])
-
-    # Create a tuple of event pair IDs to access pd.Series.isin() method
-    pairs = pd.Series(tuple(zip(pairs[0], pairs[1])), dtype=object)
-
-    return pairs
+    return pd.Series(
+        tuple(zip(
+            np.repeat(template_event_id, len(test_event_ids)), 
+            test_event_ids
+        )), 
+        dtype=object
+    )
 
 
 def select_events_with_waveforms(events, wf_file, phase):
-    event_ids = pd.Series(wf_file['event_id'][:])
-    event_ids = event_ids.str.decode('utf-8')
-    event_ids = event_ids.values
-    event_idx_lookup = pd.Series(
-        range(len(event_ids)),
+    event_ids = wf_file['event_id'][:].astype(str)
+    array_index_map = pd.Series(
+        np.arange(len(event_ids)),
         index=event_ids
     )
     mask = wf_file[f'mask_{phase}'][:]
-    event_ids = event_ids[mask]
+    event_ids = events.index.intersection(event_ids[mask])
     # Just events with waveforms
     events = events.loc[event_ids]
     # Assign lookup index.
-    events['event_index'] = event_idx_lookup[event_ids]
+    events['array_index'] = array_index_map[event_ids]
     
     return events
 
@@ -597,8 +499,8 @@ def get_waveforms(wf_file, phase, template_event, test_events, config):
         i_samp_start = max(0, i_samp_start)
         i_samp_end = min(n_samp_lead+n_samp_lag, i_samp_end)
     
-    template_event_idx = template_event['event_index']
-    test_event_idxs = test_events['event_index'].values
+    template_event_idx = template_event['array_index']
+    test_event_idxs = test_events['array_index'].values
     
     template_wf = wf_file[phase][template_event_idx, i_samp_start: i_samp_end]
     template_start_time = wf_file[f'start_time_{phase}'][template_event_idx]
@@ -618,13 +520,13 @@ def initialize_output(config, clargs, event_ids):
     n_events = len(event_ids)
     with h5py.File(out_file, mode='a') as out_file:
         out_file.create_dataset(
-            f'/event_ids',
+            '/event_ids',
             data=event_ids,
             dtype=h5py.string_dtype()
         )
         for phase in clargs.phases:
             out_file.create_dataset(
-                f'/event_pair_ids/{phase}',
+                f'/event_pairs/{phase}',
                 (0, 2),
                 maxshape=(None, 2),
                 dtype=h5py.string_dtype()
