@@ -52,6 +52,7 @@ def main():
     global ndimage
 
     clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
     my_logging.configure_logger(
         __name__,
         clargs.log_file,
@@ -77,6 +78,7 @@ def main():
 
     # Load the event database
     events = load_events(config)
+    logger.debug(f'{len(events)} events loaded.')
     out_file = initialize_output(config, clargs, events.index)
     
     with (
@@ -84,7 +86,8 @@ def main():
             h5py.File(wf_path, mode='r') as wf_file
     ):
         event_ids = wf_file['event_id'][:].astype(str)
-        serial_id_map = pd.Series(np.arange(len(event_ids)), index=event_ids)
+        #serial_id_map = pd.Series(np.arange(len(event_ids)), index=event_ids)
+        serial_id_map = pd.Series(np.arange(len(events)), index=events.index)
         for phase in clargs.phases:
             logger.info(f'Cross-correlating {phase}-wave arrivals.')
             # Load the event database
@@ -106,6 +109,7 @@ def main():
                         pool.imap(correlate_event, generator),
                         total=len(events)
                     ):
+                    #for results in pool.imap(correlate_event, generator):
                         write_results(results, phase, out_file, serial_id_map)
             else:
                 for event_id, event in tqdm.tqdm(
@@ -237,11 +241,11 @@ def parse_config(config_file):
 
 
 def init_mp(_events, _config, _wf_file):
-    global events
+    global all_events
     global config
     global wf_file
 
-    events = _events.copy()
+    all_events = _events.copy()
     config = _config
     wf_file = h5py.File(_wf_file, mode='r')
 
@@ -249,18 +253,20 @@ def init_mp(_events, _config, _wf_file):
 def correlate_event(args):
     if len(args) == 2:
         # Running in parallel mode, so use global variables.
-        global events
+        global all_events
         global config
         global wf_file
         phase, event = args
     else:
         # Running in serial
-        phase, event, events, config, wf_file = args
+        phase, event, all_events, config, wf_file = args
 
     n_pairs = config['general']['n_pairs']
     
     # Only consider events that occurred earlier in time.
-    events = events[events['time'] < event['time']].copy()
+    events = all_events[all_events['time'] < event['time']].copy()
+
+    logger.debug(f'{len(events)} candidate events for correlation against {event.name}')
 
     # Sort events by distance from template event
     sorted_events = dist_sort(
@@ -275,6 +281,8 @@ def correlate_event(args):
         n_pairs,
     )
     selected_events = selected_events.sort_index()
+
+    logger.debug(f'Correlating event {event.name} with {len(selected_events)} events.')
     
     
     # Get the waveforms
@@ -312,7 +320,7 @@ def correlate_event(args):
     i0 = np.arange(len(i1))
     cc_max = cc_max[i0, i1]
     lag = lag[i0, i1]
-    
+
     n_samp = X_template.shape[0]
     lag -= n_samp//2 + n_samp%2
 
@@ -320,11 +328,7 @@ def correlate_event(args):
     dt  = test_start_times[i0, i1] - template_start_time[i1]
     dt += lag / sampling_rate
 
-    event_pairs = form_pairs(
-        event.name, 
-        selected_events.index, 
-        sort=False
-    )
+    event_pairs = form_pairs(event.name, selected_events.index)
     event_pairs = np.asarray(list(event_pairs))
 
     # Discard measurements below threshold.
@@ -340,6 +344,7 @@ def correlate_event(args):
     cc_max = cc_max[idxs]
     event_pairs = event_pairs[idxs]
 
+    logger.debug(f'{event.name} correlated with {len(idxs)} events.')
 
     return dict(
         dt=dt, 
@@ -449,7 +454,7 @@ def dist_sort(events, event, max_dist=None):
     return events
 
 
-def form_pairs(template_event_id, test_event_ids, sort=False):
+def form_pairs(template_event_id, test_event_ids):
     # Form a list of event pair IDs for the sorted events.
     return pd.Series(
         tuple(zip(
@@ -467,7 +472,7 @@ def select_events_with_waveforms(events, wf_file, phase):
         index=event_ids
     )
     mask = wf_file[f'mask_{phase}'][:]
-    event_ids = event_ids[mask]
+    event_ids = events.index.intersection(event_ids[mask])
     # Just events with waveforms
     events = events.loc[event_ids]
     # Assign lookup index.
