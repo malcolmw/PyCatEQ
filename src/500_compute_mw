@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan 11 13:14:45 2023
+
+@author: malcolmw
+"""
+import argparse
+import configparser
+import obspy
+import pandas as pd
+import pathlib
+import sys
+import tqdm
+
+import my_logging
+
+logger = my_logging.get_logger(__name__)
+
+def main():
+    clargs = parse_clargs()
+    config = parse_config(clargs.config_file)
+    my_logging.configure_logger(
+        __name__,
+        clargs.log_file,
+        verbose=clargs.verbose
+    )
+    log_clargs(clargs)
+    log_config(config)
+    events, arrivals = load_events(config)
+    logger.info(f'Loaded {len(events)} associated with {len(arrivals)} arrivals.')
+    for event_id, event in tqdm.tqdm(events.iterrows(), total=len(events)):
+        compute_mw(event, arrivals.loc[event_id], config)
+
+    
+def parse_clargs():
+    '''
+    Parse and return command line arguments.
+    '''
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-c',
+        '--config_file',
+        type=str,
+        default=f'{sys.argv[0]}.cfg',
+        help='Configuration file.'
+    )
+    parser.add_argument(
+        '-l',
+        '--log_file',
+        type=str,
+        default=f'{sys.argv[0]}.log',
+        help='Log file.'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='store_true',
+        help='Be verbose.'
+    )
+    clargs = parser.parse_args()
+
+    return clargs
+
+
+def parse_config(config_file):
+    config = dict()
+    parser = configparser.ConfigParser()
+    parser.read(config_file)
+    config['general'] = dict(
+        catalog_path=pathlib.Path(parser.get('general', 'catalog_path')).resolve(),
+        response_dir=pathlib.Path(parser.get('general', 'response_dir')).resolve(),
+        waveform_dir=pathlib.Path(parser.get('general', 'waveform_dir')).resolve()
+    )
+
+    return config
+
+def log_clargs(clargs):
+    logger.info('***Command-line arguments***')
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    
+    
+def log_config(config):
+    logger.info('***Configuration***')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+
+
+def compute_mw(event, arrivals, config):
+    logger.debug(f'Compute Mw for event ID #{event.name}')
+
+    # - Extract event waveforms
+    X_P = load_waveforms(arrivals.loc['P'], config)
+    X_S = load_waveforms(arrivals.loc['S'], config)
+    X_N = load_waveforms(arrivals.loc['P'], config, t_lead=13/4)
+    # - Demean raw data
+    for X in (X_P, X_S, X_N):
+        X.detrend()
+
+
+    # - Remove instrument response
+    # - Extract 5/4 s signal window starting 1/4 s before
+    #   each P/S pick
+    # - Extract 5/4 s noise window ending 2 s before P pick
+    # - Calculate amplitude spectra for each window
+    # - Resample spectra in log domain with d log(f) = 0.05
+    # - Add components in quadrature
+    # - Compute SNR spectra by squaring signal/noise spectra
+    # - Discard spectra with <75% of SNR spectral amplitudes >5.0.
+    # - Skip event if number of remaining spectra < 5.
+    # - Correct spectra for radiation pattern (0.52 for P- and 0.63
+    #   for S-waves).
+    # - Integrate spectra to displacement.
+    # - Correct for for geometric spreading.
+    # - Correct for path-dependent attenuation t*.
+    # - Apply free surface correction (2.0).
+    # - Stack spectra for each phase (median logarthmic amplitude at
+    #   each frequency).
+    # - Stack SNR spectra in log(SNR) domain to estimate average SNR
+    #   at each frequency.
+    # - Determine f_L/f_H, the lowest/highest frequency for which
+    #   stacked SNR > 5.0
+    # - Fit source model.
+
+def load_events(config):
+    events = pd.read_hdf(config['general']['catalog_path'], key='/events')
+    events = events.set_index('event_id')
+    arrivals = pd.read_hdf(config['general']['catalog_path'], key='/arrivals')
+    arrivals = arrivals.set_index(['event_id', 'phase'])
+    arrivals = arrivals.sort_index()
+
+    return events, arrivals
+
+
+def load_waveforms(arrivals, wf_dir, t_lead=1/4, length=5/4, sampling_rate=100):
+    '''
+    Returns an list of obspy.Stream objects.
+    '''
+    X = list()
+    for (event_id, phase), arrival in arrivals.iterrows():
+        network, station, time = arrival[['network', 'station', 'time']]
+        path = wf_dir.joinpath(
+            time.strftime('%Y'),
+            time.strftime('%j'),
+            network,
+            station,
+            '*'
+        )
+        t0 = obspy.UTCDateTime(time)
+        stream = obspy.read(path, starttime=t0-t_lead-1, endtime=t0-t_lead+length+1)
+        stream.merge()
+        stream.sort()
+        if not all([trace.stats.sampling_rate == 100 for trace in stream]):
+            stream.resample(100)
+        for trace in stream:
+            trace.data = trace.data[int(sampling_rate):int((length+1)*sampling_rate)]
+        X.append(stream)
+        
+    return X
+
+
+
+
+    
+if __name__ == '__main__':
+    main()
