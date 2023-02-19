@@ -288,9 +288,12 @@ def populate_output(
     arrivals = arrivals.sort_values('event_id')
     arrivals = arrivals.set_index('event_id')
     sampling_rate = config['general']['sampling_rate']
-    event_ids = pd.Series(out_file['event_id'][:])
-    event_ids = event_ids.str.decode('utf-8')
-    event_ids = event_ids.values
+    event_ids = out_file['event_id'][:].astype(str)
+    mask = out_file[f'/mask_{phase}'][:]
+    arrivals = arrivals.loc[arrivals.index.intersection(event_ids[~mask])]
+
+    if len(arrivals) == 0:
+        return
 
     for event_id, arrival in tqdm.tqdm(
             arrivals.iterrows(), 
@@ -310,7 +313,6 @@ def populate_output(
             raise Exception()
             
         event_idx = event_idx[0]
-
 
         arrival_time = obspy.UTCDateTime(arrival['time'])
         start_time = arrival_time - tlead
@@ -358,7 +360,8 @@ def populate_output(
         except ValueError as error:
             logger.error(f'Caught ValueError: {error.args}.')
             continue
-        out_file[f'mask_{phase}'][event_idx] = True
+        if not np.all(out_file[phase][event_idx] == 0):
+            out_file[f'mask_{phase}'][event_idx] = True
 
     return True
 
