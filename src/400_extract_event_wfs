@@ -49,12 +49,20 @@ def parse_clargs():
         help='Log file.'
     )
     parser.add_argument(
+        '-p',
+        '--phases',
+        type=str,
+        default=f'PS',
+        help='Phases to extract.'
+    )
+    parser.add_argument(
         '-v',
         '--verbose',
         action='store_true',
         help='Be verbose.'
     )
     argc = parser.parse_args()
+    argc.phases = list(argc.phases.upper())
 
     return argc
 
@@ -334,7 +342,7 @@ def populate_output(
             for trace in stream:
                 i = CHANNEL_MAP[trace.stats.channel[2]]
                 if trace.stats.sampling_rate != sampling_rate:
-                    trace.resample(sampling_rate)
+                    trace.resample(sampling_rate, window='hann')
                 trace.filter(
                     'bandpass', 
                     freqmin=config['filter']['freq_min'],
@@ -348,11 +356,34 @@ def populate_output(
                 out_file[phase][event_idx, :len(data), i] = data
                 out_file[f'start_time_{phase}'][event_idx, i] = trace.stats.starttime.timestamp
         except ValueError as error:
-            logger.error('Caught ValueError: {error.args}.')
+            logger.error(f'Caught ValueError: {error.args}.')
             continue
         out_file[f'mask_{phase}'][event_idx] = True
 
     return True
+
+def log_clargs(clargs):
+    name = pathlib.Path(sys.argv[0]).name
+    logger.info(f'Starting script {name}...')
+    logger.info('')
+    logger.info('***Command-line arguments***')
+    for arg in sorted(vars(clargs)):
+        logger.info(f'{arg}: {getattr(clargs, arg)}')
+    logger.info('')
+    
+    
+def log_config(config):
+    logger.info('')
+    logger.info('***Configuration***')
+    for group in sorted(config):
+        if not isinstance(config[group], dict):
+            value = config[group]
+            logger.info(f'{group}: {value}')
+            continue
+        for key in sorted(config[group]):
+            value = config[group][key]
+            logger.info(f'{group}.{key}: {value}')
+    logger.info('')
 
 
 def main():
@@ -364,23 +395,15 @@ def main():
         verbose=clargs.verbose
     )
     name = pathlib.Path(sys.argv[0]).name
-    logger.info(f'Starting script {name}...')
-    for group in sorted(config):
-        if not isinstance(config[group], dict):
-            value = config[group]
-            logger.info(f'{group}: {value}')
-            continue
-        for key in sorted(config[group]):
-            value = config[group][key]
-            logger.info(f'{group}.{key}: {value}')
+    log_clargs(clargs)
+    log_config(config)
     events, arrivals = read_catalog(config['general']['catalog'])
-    #event_ids = np.sort(np.unique(arrivals['event_id'].astype(int)))
     event_ids = np.sort(np.unique(arrivals['event_id']))
     
     path = initialize_output(clargs, config, len(event_ids))
     with h5py.File(path, mode='a') as out_file:
         out_file['event_id'][:] = event_ids
-        for phase in ('P', 'S'):
+        for phase in clargs.phases:
             populate_output(
                 clargs,
                 config,
