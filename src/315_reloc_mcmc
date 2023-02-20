@@ -105,7 +105,6 @@ def parse_config(config_file):
         
     )
     config['algorithm'] = dict(
-        confidence_level=parser.getfloat('algorithm', 'confidence_level', fallback=90.),
         n_walkers=parser.getint('algorithm', 'n_walkers', fallback=8),
         n_samples=parser.getint('algorithm', 'n_samples', fallback=1024),
         max_samples=parser.getint('algorithm', 'max_samples', fallback=32768),
