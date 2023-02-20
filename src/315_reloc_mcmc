@@ -30,7 +30,8 @@ def main():
     )
     log_clargs(clargs)
     log_config(config)
-    
+   
+    path = pathlib.Path(clargs.output_path).parent.mkdir(exist_ok=True, parents=True)
     events, arrivals = load_events(config['general']['input_file'], clargs)
     locate_events(events, arrivals, clargs, config)
     
