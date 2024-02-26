@@ -117,7 +117,6 @@ def main():
     arrivals = pd.concat([result[1] for result in output], ignore_index=True)
     arrivals['time'] = pd.to_datetime(arrivals['time']*1e9, utc=True)
     events.to_hdf(config['general']['output_file'], key='/events')
-    arrivals = arrivals.reset_index()
     arrivals.to_hdf(config['general']['output_file'], key='/arrivals')
     
     
@@ -211,7 +210,7 @@ def target(event_id):
             )
             hypo = relocate(event, picks)
     else:
-        picks = arrivals.loc[event_id]
+        picks = arrivals.loc[[event_id]]
         
     hypo[:3] = pykonal.transformations.sph2geo(hypo[:3])
     event = pd.DataFrame([dict(
