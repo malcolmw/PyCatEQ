@@ -5,6 +5,7 @@ Created on Wed Jan 11 13:14:45 2023
 
 @author: malcolmw
 """
+# TODO: This script needs to append the input arrivals to the output file.
 import argparse
 import configparser
 import h5py
@@ -27,43 +28,32 @@ def main():
         verbose=clargs.verbose
     )
     log_clargs(clargs)
-    events, stations = load_catalog(clargs.catalog)
-    n_events = len(events)
-    n_stations = len(stations)
+    
+    stations, station_id_map = load_stations(clargs.network_file)
+    event_ids, event_id_map_out = load_event_ids(clargs.catalog_file)
+    arrivals = load_arrivals(clargs.catalog_file, event_ids)
+
+    initialize_output(clargs, event_ids, stations, arrivals)
+
     with h5py.File(clargs.path_out, mode='a') as out_file:
-        out_file.create_dataset(
-            '/stations',
-            data=np.array([[*station] for station in stations], dtype='S'),
-            dtype=h5py.string_dtype()
-        )
-        cc_out = out_file.create_dataset(
-            '/cc_max',
-            shape=(n_events, n_events, n_stations, 2),
-            maxshape=(None, None, None, 2),
-            chunks=(2, 2, 8, 2),
-            dtype=np.float32,
-            compression=clargs.compression
-        )
-        dt_out = out_file.create_dataset(
-            '/dt',
-            shape=(n_events, n_events, n_stations, 2),
-            maxshape=(None, None, None, 2),
-            chunks=(2, 2, 8, 2),
-            dtype=np.float64,
-            compression=clargs.compression
-        )
+        cc_out = out_file['/cc_max']
+        dt_out = out_file['/dt']
         for path in sorted(pathlib.Path(clargs.input_dir).glob('*.*.hdf5')):
             network, station, _ = path.name.split('.')
-            i_station = list(stations).index((network, station))
-            with h5py.File(path, mode='r') as in_file:
-                serial_id_map = pd.Series(
-                    np.arange(len(in_file[f'/event_ids'])),
-                    index=in_file[f'/event_ids'][:]
-                )
+            i_station = station_id_map[(network, station)]
             for i_phase, phase in enumerate(('P', 'S')):
                 with h5py.File(path, mode='r') as in_file:
-                    event_pairs = in_file[f'/event_pair_ids/{phase}'][:]
-                initargs=(serial_id_map, path, phase)
+                    event_pairs = in_file[f'/event_pairs/{phase}'][:]
+                    event_id_map_in = pd.Series(
+                        np.arange(len(in_file['event_ids'])),
+                        index=in_file['event_ids'][:].astype(str)
+                    )
+                    out_file.create_dataset(
+                        f'/event_pairs/{network}/{station}/{phase}',
+                        data=event_pairs,
+                        dtype=h5py.string_dtype()
+                    )
+                initargs=(event_id_map_in, path, phase)
                 with mp.Pool(
                     clargs.n_proc,
                     initializer=init_parallel_reader,
@@ -74,62 +64,188 @@ def main():
                         np.array_split(event_pairs, clargs.n_proc)
                     )
                 dataf = pd.concat(out, ignore_index=True)
-                dataf['serial_id_A'] = serial_id_map[
-                    dataf['template_event_id'].values
-                ].values
-                dataf['serial_id_B'] = serial_id_map[
-                    dataf['test_event_id'].values
-                ].values
-                dataf = dataf.sort_values(['serial_id_A', 'serial_id_B'])
-                dataf = dataf.set_index('serial_id_A')
-
-                pbar = tqdm.tqdm(
-                    total=len(dataf),
-                    position=0,
-                    leave=True,
-                    desc=f'{network}.{station}.{phase}',
-                    ncols=80
+                write_output(
+                    dataf,
+                    dt_out,
+                    cc_out,
+                    i_station,
+                    i_phase,
+                    event_id_map_out,
+                    desc=f'{network}.{station}.{phase}'
                 )
-                for serial_id_A in dataf.index.unique()[:100]:
-                    dataf_ = dataf.loc[[serial_id_A]]
-                    cc_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['cc'].values
-                    dt_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['dt'].values
-                    pbar.update(len(dataf_))
+        update_unique_pairs(out_file)
+
+def update_unique_pairs(out_file):
+    args = [
+        (network, station, phase)
+        for network in sorted(out_file['/event_pairs'])
+        for station in sorted(out_file[f'/event_pairs/{network}'])
+        for phase in sorted(out_file[f'/event_pairs/{network}/{station}'])
+    ]
+    event_pairs = list()
+    for network, station, phase in args:
+        logger.info((network, station, phase))
+        event_pairs_ = out_file[
+            f'/event_pairs/{network}/{station}/{phase}'
+        ][:].astype(str)
+        event_pairs_ = np.sort(event_pairs_, axis=1)
+        event_pairs_ = pd.MultiIndex.from_arrays(event_pairs_.T)
+        event_pairs_ = event_pairs_.unique()
+        event_pairs.append(event_pairs_)
+    logger.debug('Concatenating all pairs.')
+    all_pairs = pd.MultiIndex.from_arrays([
+        np.concatenate([
+            pairs.get_level_values(0) for pairs in event_pairs
+        ]),
+        np.concatenate([
+            pairs.get_level_values(1) for pairs in event_pairs
+        ]),
+    ])
+    logger.debug('Finding unique pairs.')
+    unique_pairs = all_pairs.unique()
+    unique_pairs = np.stack(
+        [
+            unique_pairs.get_level_values(0).values,
+            unique_pairs.get_level_values(1).values
+        ],
+        axis=1
+    )
+    if '/unique_pairs' in out_file:
+        logger.debug('Deleting old unique pairs list.')
+        del(out_file['/unique_pairs'])
+    logger.debug('Writing unique pairs list.')
+    out_file.create_dataset(
+        '/unique_pairs',
+        data=unique_pairs.astype('S')
+    )
 
 
-def init_parallel_reader(serial_id_map_, path, phase):
-    global serial_id_map
+
+def read_event_ids(network, station, phase):
+    with DifferentialsFile(DT_PATH, mode='r') as dt_file:
+        event_ids = dt_file[f'/event_pairs/{network}/{station}/{phase}'][:].astype(str)
+        event_ids = np.sort(event_ids, axis=1)
+        event_ids = pd.MultiIndex.from_arrays(event_ids.T)
+        event_ids = event_ids.unique()
+    return event_ids
+
+
+def write_output(dataf, dt_out, cc_out, i_station, i_phase, event_id_map, desc=None):
+    dataf['serial_id_A'] = event_id_map[dataf['event_id_A'].values].values
+    dataf['serial_id_B'] = event_id_map[dataf['event_id_B'].values].values
+    dataf = dataf.sort_values(['serial_id_A', 'serial_id_B'])
+    dataf = dataf.set_index('serial_id_A')
+
+    pbar = tqdm.tqdm(
+        total=len(dataf),
+        position=0,
+        leave=True,
+        desc=desc,
+        ncols=80
+    )
+    for serial_id_A in dataf.index.unique():
+        dataf_ = dataf.loc[[serial_id_A]]
+        cc_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['cc'].values
+        dt_out[serial_id_A, dataf_['serial_id_B'].values, i_station, i_phase] = dataf_['dt'].values
+        pbar.update(len(dataf_))
+
+
+def initialize_output(clargs, event_ids, stations, arrivals):
+    n_events = len(event_ids)
+    n_stations = len(stations)
+
+    arrivals.to_hdf(clargs.path_out, key='/arrivals')
+
+    with h5py.File(clargs.path_out, mode='a') as out_file:
+        if '/event_ids' not in out_file:
+            out_file.create_dataset(
+                '/event_ids',
+                data=event_ids.astype('S')
+            )
+        if '/stations' not in out_file:
+            out_file.create_dataset(
+                '/stations',
+                data=stations.astype('S')
+            )
+        if '/cc_max' not in out_file:
+            out_file.create_dataset(
+                '/cc_max',
+                shape=(n_events, n_events, n_stations, 2),
+                maxshape=(None, None, None, 2),
+                chunks=(2, 2, 8, 2),
+                dtype=np.float32,
+                compression=clargs.compression
+            )
+            out_file.create_dataset(
+                '/dt',
+                shape=(n_events, n_events, n_stations, 2),
+                maxshape=(None, None, None, 2),
+                chunks=(2, 2, 8, 2),
+                dtype=np.float64,
+                compression=clargs.compression
+            )
+
+def init_parallel_reader(event_id_map_in_, path, phase):
+    global event_id_map_in
     global cc_in
     global dt_in
-    serial_id_map = serial_id_map_
-    file = h5py.File(path, mode='r')
-    cc_in = file[f'/cc_max/{phase}']
-    dt_in = file[f'/dt/{phase}']
+    event_id_map_in = event_id_map_in_
+    in_file = h5py.File(path, mode='r')
+    cc_in = in_file[f'/cc_max/{phase}']
+    dt_in = in_file[f'/dt/{phase}']
 
 
-def load_catalog(path):
+def load_arrivals(path, event_ids):
+    arrivals = pd.read_hdf(path, key='/arrivals')
+    arrivals = arrivals.set_index('event_id')
+    arrivals = arrivals.sort_index()
+    arrivals = arrivals.loc[event_ids]
+    arrivals = arrivals.reset_index()
+
+    logger.info(f'Loaded {len(arrivals):,d} arrivals.')
+
+    return arrivals
+
+def load_event_ids(path):
     events = pd.read_hdf(path, key='/events')
-    events = events.set_index('event_id')
-    events = events.sort_index()
+    event_ids = events['event_id'].values
     logger.info(f'Loaded {len(events):,d} events.')
 
-    arrivals = pd.read_hdf(path, key='/arrivals')
-    arrivals = arrivals.set_index(['network', 'station'])
-    stations = np.sort(arrivals.index.unique())
-    logger.info(f'Loaded {len(stations):,d} stations.')
+    event_id_map_out = pd.Series(
+        np.arange(len(event_ids)),
+        index=event_ids
+    )
 
-    return events, stations
+    return event_ids, event_id_map_out
+
+
+def load_stations(path):
+    stations = pd.read_hdf(path, key='/network')
+    stations = stations.drop_duplicates(['network', 'station'])
+    stations = stations[['network', 'station']]
+    stations = stations.sort_values(['network', 'station'])
+    stations = stations.reset_index(drop=True)
+    stations = stations.values
+
+    station_id_map = pd.Series(
+        np.arange(len(stations)),
+        index=pd.MultiIndex.from_arrays([
+            stations[:, 0],
+            stations[:, 1]
+        ])
+    )
+
+    return stations, station_id_map
 
 
 def parallel_reader(event_pairs):
-    global serial_id_map
+    global event_id_map_in
     global cc_in
     global dt_in
     cc_out, dt_out = list(), list()
-    for event_pair in event_pairs:
-        event_id_A, event_id_B = min(event_pair), max(event_pair)
-        serial_id_A = serial_id_map[event_id_A]
-        serial_id_B = serial_id_map[event_id_B]
+    for event_id_A, event_id_B in event_pairs.astype(str):
+        serial_id_A = event_id_map_in[event_id_A]
+        serial_id_B = event_id_map_in[event_id_B]
         idx_in = (serial_id_A, serial_id_B)
         cc_out.append(cc_in[idx_in])
         dt_out.append(dt_in[idx_in])
@@ -137,8 +253,8 @@ def parallel_reader(event_pairs):
     return pd.DataFrame(dict(
         cc=cc_out,
         dt=dt_out,
-        template_event_id=event_pairs[:, 0],
-        test_event_id=event_pairs[:, 1]
+        event_id_A=event_pairs[:, 0].astype(str),
+        event_id_B=event_pairs[:, 1].astype(str)
     ))
 
     
@@ -154,9 +270,14 @@ def parse_clargs():
         help='Input directory to merge.'
     )
     parser.add_argument(
-        'catalog',
+        'network_file',
         type=str,
-        help='Input catalog.'
+        help='List of stations.'
+    )
+    parser.add_argument(
+        'catalog_file',
+        type=str,
+        help='Catalog file.'
     )
     parser.add_argument(
         'path_out',

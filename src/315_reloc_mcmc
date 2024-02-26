@@ -342,7 +342,6 @@ def plot(sampler):
     plt.show()
     
 def load_residual_rvs(config):
-    import scipy.stats
     pick_errors = load_pick_errors(config['uncertainty']['model'])
     residual_errors = load_residual_errors(config['uncertainty']['model'])
 
@@ -377,5 +376,5 @@ def log_probability(args):
 
 
 
-if __name__ == '__main__':
-    main()
+# if __name__ == '__main__':
+#     main()

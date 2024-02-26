@@ -86,7 +86,6 @@ def main():
             h5py.File(wf_path, mode='r') as wf_file
     ):
         event_ids = wf_file['event_id'][:].astype(str)
-        #serial_id_map = pd.Series(np.arange(len(event_ids)), index=event_ids)
         serial_id_map = pd.Series(np.arange(len(events)), index=events.index)
         for phase in clargs.phases:
             logger.info(f'Cross-correlating {phase}-wave arrivals.')
@@ -109,11 +108,10 @@ def main():
                         pool.imap(correlate_event, generator),
                         total=len(events)
                     ):
-                    #for results in pool.imap(correlate_event, generator):
                         write_results(results, phase, out_file, serial_id_map)
             else:
                 for event_id, event in tqdm.tqdm(
-                    events.iterrows(), 
+                    events.iloc[800:].iterrows(), 
                     total=len(events)
                 ):
                     results = correlate_event((
@@ -266,7 +264,7 @@ def correlate_event(args):
     # Only consider events that occurred earlier in time.
     events = all_events[all_events['time'] < event['time']].copy()
 
-    logger.debug(f'{len(events)} candidate events for correlation against {event.name}')
+    #logger.debug(f'{len(events)} candidate events for correlation against {event.name}')
 
     # Sort events by distance from template event
     sorted_events = dist_sort(
@@ -282,7 +280,7 @@ def correlate_event(args):
     )
     selected_events = selected_events.sort_index()
 
-    logger.debug(f'Correlating event {event.name} with {len(selected_events)} events.')
+    #logger.debug(f'Correlating event {event.name} with {len(selected_events)} events.')
     
     
     # Get the waveforms
@@ -344,7 +342,7 @@ def correlate_event(args):
     cc_max = cc_max[idxs]
     event_pairs = event_pairs[idxs]
 
-    logger.debug(f'{event.name} correlated with {len(idxs)} events.')
+    logger.debug(f'{event.name} correlated with {len(cc_max)} events.')
 
     return dict(
         dt=dt, 
@@ -536,7 +534,7 @@ def initialize_output(config, clargs, event_ids):
                 (n_events, n_events),
                 maxshape=(None, None),
                 dtype=np.float64,
-                chunks=(32, 32),
+                chunks=(8, 8),
                 compression=3
             )
             out_file.create_dataset(
@@ -544,7 +542,7 @@ def initialize_output(config, clargs, event_ids):
                 (n_events, n_events),
                 maxshape=(None, None),
                 dtype=np.float32,
-                chunks=(32, 32),
+                chunks=(8, 8),
                 compression=3
             )
         file_name = out_file.filename

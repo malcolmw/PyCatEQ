@@ -91,8 +91,13 @@ def read_phase_sel(path):
     events['time'] = pd.to_datetime(
         events['year'].astype(str)
         + events['month'].map(lambda month: f'-{month:02d}')
-        + events['day'].map(lambda day: f'-{day:02d}')
-        + events['time_of_day'].map(lambda time: f'T{time}Z')
+        + events['day'].map(lambda day: f'-{day:02d}'),
+        #+ events['time_of_day'].map(lambda time: f'T{time}Z'),
+        utc=True
+    )
+    events['time'] += pd.to_timedelta(
+        events['seconds_of_day'],
+        unit='S'
     )
     
     events = events.drop(columns=[

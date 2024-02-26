@@ -117,6 +117,7 @@ def main():
     arrivals = pd.concat([result[1] for result in output], ignore_index=True)
     arrivals['time'] = pd.to_datetime(arrivals['time']*1e9, utc=True)
     events.to_hdf(config['general']['output_file'], key='/events')
+    arrivals = arrivals.reset_index()
     arrivals.to_hdf(config['general']['output_file'], key='/arrivals')
     
     
@@ -236,6 +237,7 @@ def reassociate(hypo):
     min_coords = (hypo-search_range)[:3]
     max_coords = (hypo+search_range)[:3]
     picks = list()
+    logger.debug(phase_ids)
     for phase_id in phase_ids:
         network, station, phase = phase_id
         _candidates = candidate_picks.loc[phase_id]
