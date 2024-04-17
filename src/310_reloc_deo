@@ -10,6 +10,9 @@ import pykonal
 import sys
 import tqdm
 import warnings; warnings.filterwarnings('ignore')
+
+# Local imports
+import locate
 import my_logging
 
 logger = my_logging.get_logger(__name__)
@@ -53,7 +56,8 @@ def parse_config(config_file):
     config['general'] = dict(
         input_file=pathlib.Path(parser.get('general', 'input_file')).resolve(),
         output_file=pathlib.Path(parser.get('general', 'output_file')).resolve(),
-        tt_inv_path=pathlib.Path(parser.get('general', 'tt_inv_path')).resolve()
+        tt_inv_path=pathlib.Path(parser.get('general', 'tt_inv_path')).resolve(),
+        norm=parser.get('general', 'norm', fallback='EDT')
     )
     config['range'] = dict(
         d_lat=parser.getfloat('range', 'd_lat'),
@@ -98,7 +102,7 @@ def main():
         for key in sorted(config[group]):
             value = config[group][key]
             logger.info(f'{group}.{key}: {value}')
-    
+
     events, arrivals, candidate_picks = load_events(config)
 
     with mp.Pool(
@@ -160,6 +164,7 @@ def load_events(config):
     return events, arrivals, candidate_picks
 
 def relocate(event, arrivals):
+    global config
     global locator
     global search_range
 
@@ -167,8 +172,8 @@ def relocate(event, arrivals):
     arrival_dict = get_arrival_dict(event_id, arrivals)
     locator.clear_arrivals()
     locator.add_arrivals(arrival_dict)
-    hypo = event[['rho', 'theta', 'phi', 'time']].values
-    hypo = locator.locate(hypo, search_range)
+    hypo = event[['rho', 'theta', 'phi', 'time']].values.astype(float)
+    hypo = locator.locate(hypo, search_range, norm=config['general']['norm'])
     
     return hypo
     
@@ -279,7 +284,7 @@ def init_pool(_config, _events, _arrivals, _candidate_picks):
     candidate_picks = _candidate_picks
     if candidate_picks is not None:
         phase_ids = candidate_picks.index.unique()
-    locator = pykonal.locate.EQLocator(str(config['general']['tt_inv_path']))
+    locator = locate.EQLocator(str(config['general']['tt_inv_path']))
     search_range = np.array([
         config['range']['d_depth'],
         np.radians(config['range']['d_lon']),
